@@ -1,5 +1,5 @@
 # deid.py - Clinical De-identification Surrogate Generator
-# v2.1.0 - Added name normalization, NPI/Group handling, DOB cleanup
+# v2.2.0 - Age-preserving DOB replacement
 #
 # Key features:
 # - Consistent replacement within documents (same PHI → same fake)
@@ -9,6 +9,7 @@
 # - Geographic consistency (city/state/zip match)
 # - Name normalization (Dr. Sarah Johnson, MD → same fake as Sarah Johnson)
 # - DOB line cleanup (prevents concatenated date artifacts)
+# - Age-preserving DOB (±2 year jitter keeps patient age realistic)
 
 from faker import Faker
 from datetime import datetime, timedelta
@@ -121,7 +122,7 @@ class ClinicalDeidentifier:
             return self._shift_date(text)
         
         elif entity_type == "DATE_OF_BIRTH":
-            return self._shift_date(text)
+            return self._generate_dob(text)
         
         elif entity_type == "DATE_TIME":
             return self._shift_datetime(text)
@@ -224,6 +225,28 @@ class ClinicalDeidentifier:
         
         # Couldn't parse - return shifted placeholder that looks like a date
         return self.fake.date(pattern="%m/%d/%Y")
+    
+    def _generate_dob(self, text: str) -> str:
+        """Generate realistic DOB preserving approximate age (±2 years)."""
+        parsed = self._parse_date(text)
+        if parsed:
+            dt, fmt = parsed
+            # Small year jitter (±2 years) to preserve approximate age
+            year_jitter = random.randint(-2, 2)
+            # Random month and day
+            new_month = random.randint(1, 12)
+            new_day = random.randint(1, 28)  # Safe for all months
+            
+            try:
+                shifted = dt.replace(year=dt.year + year_jitter, month=new_month, day=new_day)
+                return shifted.strftime(fmt)
+            except ValueError:
+                # Handle edge cases
+                shifted = dt.replace(year=dt.year + year_jitter, month=new_month, day=15)
+                return shifted.strftime(fmt)
+        
+        # Couldn't parse - generate realistic adult DOB
+        return self.fake.date_of_birth(minimum_age=18, maximum_age=90).strftime("%m/%d/%Y")
     
     def _shift_datetime(self, text: str) -> str:
         """Shift datetime, preserving format including time."""
