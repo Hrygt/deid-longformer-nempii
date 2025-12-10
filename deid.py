@@ -1,5 +1,5 @@
 # deid.py - Clinical De-identification Surrogate Generator
-# v2.2.0 - Age-preserving DOB replacement
+# v2.2.1 - Context-aware DOB detection
 #
 # Key features:
 # - Consistent replacement within documents (same PHI → same fake)
@@ -10,6 +10,7 @@
 # - Name normalization (Dr. Sarah Johnson, MD → same fake as Sarah Johnson)
 # - DOB line cleanup (prevents concatenated date artifacts)
 # - Age-preserving DOB (±2 year jitter keeps patient age realistic)
+# - Context-aware DOB detection (DATE after "DOB:" treated as DATE_OF_BIRTH)
 
 from faker import Faker
 from datetime import datetime, timedelta
@@ -531,7 +532,18 @@ def deidentify_text(text: str, entities: list, seed: int = None) -> str:
     
     result = text
     for entity in sorted_entities:
-        replacement = deid.replace(entity["text"], entity["type"])
+        entity_type = entity["type"]
+        
+        # Context-aware DOB detection: if DATE entity follows "DOB:" treat as DATE_OF_BIRTH
+        # This preserves patient age since model doesn't distinguish DOB from other dates
+        if entity_type == "DATE":
+            # Look at 25 chars before entity for DOB context
+            lookback_start = max(0, entity["start"] - 25)
+            context = text[lookback_start:entity["start"]].lower()
+            if "dob:" in context or "dob :" in context or "date of birth" in context or "birth date" in context or "birthdate" in context:
+                entity_type = "DATE_OF_BIRTH"
+        
+        replacement = deid.replace(entity["text"], entity_type)
         result = result[:entity["start"]] + replacement + result[entity["end"]:]
     
     # Post-process DOB line(s) to keep a single clean date
