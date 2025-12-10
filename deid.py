@@ -1,5 +1,5 @@
 # deid.py - Clinical De-identification Surrogate Generator
-# v2.0.0 - Professional-grade realistic replacements
+# v2.1.0 - Added name normalization, NPI/Group handling, DOB cleanup
 #
 # Key features:
 # - Consistent replacement within documents (same PHI → same fake)
@@ -7,12 +7,55 @@
 # - Realistic surrogates (not bracketed placeholders)
 # - Date shifting preserves temporal relationships
 # - Geographic consistency (city/state/zip match)
+# - Name normalization (Dr. Sarah Johnson, MD → same fake as Sarah Johnson)
+# - DOB line cleanup (prevents concatenated date artifacts)
 
 from faker import Faker
 from datetime import datetime, timedelta
 import random
 import re
 from typing import Optional, Tuple
+
+
+def normalize_name(name: str) -> str:
+    """
+    Normalize a clinician/patient name so that variants like
+    'Dr. Sarah Elizabeth Johnson, MD' and 'Sarah E. Johnson, MD'
+    map to the same cache key.
+    """
+    n = name.lower()
+    # Remove common titles/credentials
+    n = re.sub(r'\b(dr\.?|md|do|phd|rn|np|pa\-c|dpm|dds|od|pharmd|pt|ot|cna|lpn|lvn|aprn|crna|dnp|mph|ms|ma|bs|ba|jr\.?|sr\.?|ii|iii|iv)\b', '', n)
+    # Remove non-letter characters except spaces
+    n = re.sub(r'[^a-z\s]', ' ', n)
+    # Collapse multiple spaces
+    n = re.sub(r'\s+', ' ', n).strip()
+    parts = n.split()
+    if len(parts) >= 2:
+        # First + last name only; ignore middle/initials
+        return f"{parts[0]} {parts[-1]}"
+    return n.strip()
+
+
+# DOB line cleanup regex patterns
+DOB_LINE_RE = re.compile(r'^(DOB:\s*)(.+)$', re.MULTILINE | re.IGNORECASE)
+DATE_RE = re.compile(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}')
+
+
+def _clean_dob_lines(text: str) -> str:
+    """
+    Post-process DOB lines so that if multiple dates ended up on the same line
+    (e.g., from overlapping entity replacements), we keep only the first clean date.
+    """
+    def repl(match: re.Match) -> str:
+        prefix, rest = match.groups()
+        dates = DATE_RE.findall(rest)
+        if not dates:
+            return match.group(0)
+        # Use the first detected date; discard any extra concatenated dates
+        return f"{prefix}{dates[0]}"
+    return DOB_LINE_RE.sub(repl, text)
+
 
 class ClinicalDeidentifier:
     def __init__(self, seed: Optional[int] = None):
@@ -34,9 +77,10 @@ class ClinicalDeidentifier:
     
     def _get_cached(self, original: str, entity_type: str, generator_fn):
         """Ensure consistent replacement within a document."""
-        # Normalize key (case-insensitive for names)
+        # Use normalized key for names so variants map to same fake
         if entity_type in ("FIRST_NAME", "LAST_NAME", "NAME"):
-            key = f"{entity_type}:{original.lower().strip()}"
+            norm = normalize_name(original)
+            key = f"NAME:{norm}"
         else:
             key = f"{entity_type}:{original.strip()}"
         
@@ -117,6 +161,14 @@ class ClinicalDeidentifier:
         
         elif entity_type == "BIOMETRIC_IDENTIFIER":
             return self._generate_id(text, prefix="BIO")
+        
+        elif entity_type == "NPI":
+            # National Provider Identifier (unique clinician ID)
+            return self._generate_npi(text)
+        
+        elif entity_type in ("GROUP_NUMBER", "INSURANCE_GROUP_NUMBER", "GROUP_ID"):
+            # Insurance group number / plan group id
+            return self._generate_id(text, prefix="GRP")
         
         # === CONTACT INFO ===
         elif entity_type == "PHONE_NUMBER":
@@ -300,6 +352,20 @@ class ClinicalDeidentifier:
         
         return chars
     
+    def _generate_npi(self, original: str) -> str:
+        """Generate fake NPI (National Provider Identifier)."""
+        original = original.strip()
+        
+        # NPI is always 10 digits
+        # But preserve format if there's a prefix
+        prefix_match = re.match(r'^([A-Za-z]+)[-_:\s]*', original)
+        if prefix_match:
+            prefix = prefix_match.group(1)
+            return f"{prefix}{random.randint(1000000000, 9999999999)}"
+        
+        # Standard 10-digit NPI
+        return str(random.randint(1000000000, 9999999999))
+    
     def _generate_license(self, original: str) -> str:
         """Generate fake license/certificate number."""
         original = original.strip()
@@ -444,5 +510,8 @@ def deidentify_text(text: str, entities: list, seed: int = None) -> str:
     for entity in sorted_entities:
         replacement = deid.replace(entity["text"], entity["type"])
         result = result[:entity["start"]] + replacement + result[entity["end"]:]
+    
+    # Post-process DOB line(s) to keep a single clean date
+    result = _clean_dob_lines(result)
     
     return result
