@@ -1,5 +1,5 @@
 # deid.py - Clinical De-identification Surrogate Generator
-# v2.3.0 - Adjacent name entity combination for consistent replacements
+# v2.3.1 - Fix DATE entity fragmentation on longer documents
 #
 # Key features:
 # - Consistent replacement within documents (same PHI → same fake)
@@ -12,6 +12,7 @@
 # - Age-preserving DOB (±2 year jitter keeps patient age realistic)
 # - Context-aware DOB detection (DATE after "DOB:" gets age-preserving replacement)
 # - Adjacent name combination (FIRST_NAME + LAST_NAME → NAME for consistent cache lookup)
+# - DATE entity merging (fixes model fragmenting dates into pieces)
 
 from faker import Faker
 from datetime import datetime, timedelta
@@ -58,6 +59,75 @@ def _clean_dob_lines(text: str) -> str:
         # Use the first detected date; discard any extra concatenated dates
         return f"{prefix}{dates[0]}"
     return DOB_LINE_RE.sub(repl, text)
+
+
+def _merge_adjacent_date_entities(entities: list, text: str) -> list:
+    """
+    Merge adjacent DATE/DATE_TIME/DATE_OF_BIRTH entities that got fragmented by the model.
+    For example, "03/15/1965" might get split into "03", "/", "15", "/", "1965".
+    This merges them back into a single entity.
+    """
+    date_types = {"DATE", "DATE_TIME", "DATE_OF_BIRTH"}
+    
+    # Sort by position
+    sorted_ents = sorted(entities, key=lambda x: x["start"])
+    
+    merged = []
+    i = 0
+    while i < len(sorted_ents):
+        curr = sorted_ents[i]
+        
+        if curr["type"] not in date_types:
+            merged.append(curr.copy())
+            i += 1
+            continue
+        
+        # Try to combine with following date-like entities
+        group_start = curr["start"]
+        group_end = curr["end"]
+        j = i + 1
+        
+        while j < len(sorted_ents):
+            next_ent = sorted_ents[j]
+            # Accept any date-type entity or even short gaps
+            if next_ent["type"] not in date_types:
+                # Check if there's a small gap that looks like part of a date
+                gap = next_ent["start"] - group_end
+                if gap > 3:  # Too far apart
+                    break
+                # Skip non-date entities in the gap
+                j += 1
+                continue
+            
+            gap = next_ent["start"] - group_end
+            # Allow gap of up to 1 char for slashes/dashes that might not be entities
+            if gap > 1:
+                break
+            
+            # Check gap only contains date separators
+            gap_text = text[group_end:next_ent["start"]]
+            if gap_text and not all(c in "/-" for c in gap_text):
+                break
+            
+            group_end = next_ent["end"]
+            j += 1
+        
+        # Create merged entity
+        combined_text = text[group_start:group_end]
+        # Only merge if it looks like a date pattern
+        if j > i + 1 and DATE_RE.search(combined_text):
+            merged.append({
+                "type": "DATE",  # Will be re-classified by context detection
+                "start": group_start,
+                "end": group_end,
+                "text": combined_text
+            })
+            i = j
+        else:
+            merged.append(curr.copy())
+            i += 1
+    
+    return merged
 
 
 def _combine_adjacent_name_entities(entities: list, text: str) -> list:
@@ -594,6 +664,10 @@ def deidentify_text(text: str, entities: list, seed: int = None) -> str:
     deid = ClinicalDeidentifier(seed=seed)
     deid.reset_cache()
     
+    # Pre-process: Merge fragmented DATE entities back together
+    # Model sometimes splits "03/15/1965" into "03", "/", "15", etc.
+    entities = _merge_adjacent_date_entities(entities, text)
+    
     # Pre-process: Combine adjacent FIRST_NAME/LAST_NAME into single NAME entities
     # This ensures "Sarah" + "Johnson" gets same cache key as "Sarah Elizabeth Johnson"
     entities = _combine_adjacent_name_entities(entities, text)
@@ -608,8 +682,8 @@ def deidentify_text(text: str, entities: list, seed: int = None) -> str:
         # Context-aware DOB detection: if DATE entity follows "DOB:" treat as DATE_OF_BIRTH
         # This preserves patient age since model doesn't distinguish DOB from other dates
         if entity_type == "DATE":
-            # Look at 25 chars before entity for DOB context
-            lookback_start = max(0, entity["start"] - 25)
+            # Look at 50 chars before entity for DOB context
+            lookback_start = max(0, entity["start"] - 50)
             context = text[lookback_start:entity["start"]].lower()
             if "dob:" in context or "dob :" in context or "date of birth" in context or "birth date" in context or "birthdate" in context:
                 entity_type = "DATE_OF_BIRTH"
