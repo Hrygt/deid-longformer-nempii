@@ -255,7 +255,8 @@ class ClinicalDeidentifier:
         if not t:
             return token
         if t not in self._first_tokens:
-            self._first_tokens[t] = self.fake.first_name()
+            ov = getattr(self, "_name_overrides", {}).get("first", {}).get(t)
+            self._first_tokens[t] = ov or self.fake.first_name()
         return self._first_tokens[t]
 
     def _fake_last(self, token: str) -> str:
@@ -263,12 +264,19 @@ class ClinicalDeidentifier:
         if not t:
             return token
         if t not in self._last_tokens:
-            self._last_tokens[t] = self.fake.last_name()
+            ov = getattr(self, "_name_overrides", {}).get("last", {}).get(t)
+            self._last_tokens[t] = ov or self.fake.last_name()
         return self._last_tokens[t]
 
     def _fake_name(self, text: str) -> str:
         """Compose a full-name surrogate from per-token caches, so a full name and
         its standalone first/last variants resolve to the SAME fake tokens."""
+        # LLM-resolved override (coref-clustered, sex-matched) takes precedence.
+        full_ov = getattr(self, "_name_overrides", {}).get("full", {})
+        if full_ov:
+            key = normalize_name(text)
+            if key in full_ov:
+                return full_ov[key]
         cleaned = re.sub(r"[^a-zA-Z,\s]", " ", text)
         if "," in cleaned:  # "Last, First" form
             last_part, _, first_part = cleaned.partition(",")
@@ -729,7 +737,7 @@ class ClinicalDeidentifier:
 
 # === Utility for batch processing ===
 
-def deidentify_text(text: str, entities: list, seed: int = None) -> str:
+def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict = None) -> str:
     """
     Replace entities in text with surrogate data.
     
@@ -743,7 +751,9 @@ def deidentify_text(text: str, entities: list, seed: int = None) -> str:
     """
     deid = ClinicalDeidentifier(seed=seed)
     deid.reset_cache()
-    
+    # LLM-resolved name overrides (coref clusters + sex-matched surrogates), if provided.
+    deid._name_overrides = name_map or {}
+
     # Pre-process: Merge fragmented DATE entities back together
     # Model sometimes splits "03/15/1965" into "03", "/", "15", etc.
     entities = _merge_adjacent_date_entities(entities, text)

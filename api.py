@@ -15,7 +15,7 @@ import os
 import re
 
 from labels import ID2LABEL, ENTITY_TYPES
-from deid import ClinicalDeidentifier, deidentify_text
+from deid import ClinicalDeidentifier, deidentify_text, normalize_name
 from medical_whitelist import MEDICAL_WHITELIST_LOWER
 
 # === Configuration ===
@@ -480,6 +480,66 @@ def filter_whitelisted_entities(entities: list[dict]) -> list[dict]:
 
 # deidentify_text is now imported from deid.py (includes DOB cleanup)
 
+RESOLVE_MODEL = os.environ.get("DEID_RESOLVE_MODEL", "us.anthropic.claude-sonnet-4-6")
+RESOLVE_ENABLED = os.environ.get("DEID_RESOLVE", "on").lower() not in ("off", "0", "false", "no")
+
+
+def resolve_names(text: str, entities: list) -> dict:
+    """Cluster detected person-names by identity and assign one sex-matched surrogate
+    per person (via an LLM), so coreference variants stay consistent and the patient's
+    fake name matches their documented sex. Returns a name-override map, or {} on any
+    failure (de-id then falls back to per-name surrogate generation)."""
+    if not RESOLVE_ENABLED:
+        return {}
+    names, seen = [], set()
+    for e in entities:
+        if e.get("type") in ("NAME", "FIRST_NAME", "LAST_NAME"):
+            t = (e.get("text") or "").strip()
+            if t and t.lower() not in seen:
+                seen.add(t.lower())
+                names.append(t)
+    if not names:
+        return {}
+    try:
+        import boto3
+        import json as _json
+        client = boto3.client("bedrock-runtime", region_name=os.environ.get("AWS_REGION", "us-west-2"))
+        prompt = (
+            "These person-name strings were detected in ONE patient's clinical chart. "
+            "Group them by which refer to the SAME person (account for first-only, last-only, "
+            "nickname, and 'Mr./Ms.' forms). Mark which group is THE PATIENT (the chart's subject). "
+            "For each group, infer the apparent sex (M, F, or U) and give a realistic, common fake "
+            "FULL name matching that sex.\n\nNAMES:\n"
+            + "\n".join(f"- {n}" for n in names[:200])
+            + '\n\nReturn ONLY JSON: {"groups":[{"names":["..."],"is_patient":true,'
+              '"sex":"M","fake_first":"...","fake_last":"..."}]}'
+        )
+        body = _json.dumps({"anthropic_version": "bedrock-2023-05-31", "max_tokens": 1500,
+                            "messages": [{"role": "user", "content": prompt}]})
+        resp = client.invoke_model(modelId=RESOLVE_MODEL, body=body)
+        out = _json.loads(resp["body"].read())["content"][0]["text"]
+        match = re.search(r"\{.*\}", out, re.DOTALL)
+        data = _json.loads(match.group(0) if match else out)
+        full, first, last = {}, {}, {}
+        titles = {"dr", "mr", "mrs", "ms", "miss", "md", "do", "rn", "np", "pa", "phd"}
+        for g in data.get("groups", []):
+            ff = (g.get("fake_first") or "").strip()
+            fl = (g.get("fake_last") or "").strip()
+            fake_full = (ff + " " + fl).strip()
+            for nm in [s.strip() for s in g.get("names", []) if s and s.strip()]:
+                if fake_full:
+                    full[normalize_name(nm)] = fake_full
+                toks = [t for t in re.sub(r"[^a-zA-Z\s]", " ", nm).split() if t.lower() not in titles]
+                if toks:
+                    if ff:
+                        first[toks[0].lower()] = ff
+                    if fl:
+                        last[toks[-1].lower()] = fl
+        return {"full": full, "first": first, "last": last}
+    except Exception as exc:  # noqa: BLE001
+        print(f"resolve_names fallback (no LLM clustering): {exc}")
+        return {}
+
 
 # === API Endpoints ===
 @app.get("/deid/health", response_model=HealthResponse)
@@ -537,9 +597,12 @@ async def process_text(request: DeidRequest):
     
     # Filter out whitelisted medical terms (prevents false positives)
     entities = filter_whitelisted_entities(entities)
-    
+
+    # Resolve person-name identities (coref + sex-matched surrogates); {} = fall back.
+    name_map = resolve_names(request.text, entities)
+
     # De-identify
-    deidentified = deidentify_text(request.text, entities, request.seed)
+    deidentified = deidentify_text(request.text, entities, request.seed, name_map=name_map)
     
     processing_time = (time.time() - start_time) * 1000
     

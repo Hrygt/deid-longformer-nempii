@@ -10,6 +10,22 @@
 # Maintainer: Gary Riggs, MD | RIGGSMED LLC
 
 MEDICAL_WHITELIST = {
+    # === ROLE WORDS / ABBREVIATIONS THE NER MISREADS AS NAMES ===
+    # e.g. "Pt reports..." (= patient) was being surrogate-replaced with a fake
+    # first name like "Patricia". These are never real patient names.
+    "Pt",
+    "Pts",
+    "Patient",
+    "Patients",
+    "Mom",
+    "Dad",
+    "Wife",
+    "Husband",
+    "Spouse",
+    "Mother",
+    "Father",
+    "Son",
+    "Daughter",
     # === LAB VALUES & CHEMISTRY ===
     "Anion Gap",
     "Base Excess",
