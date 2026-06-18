@@ -549,6 +549,70 @@ def resolve_names(text: str, entities: list) -> dict:
         return {}
 
 
+# --- Recall safety net: catch names the neural NER misses (e.g. "Nurse Iqbal") ---
+RECALL_TITLES = os.environ.get("DEID_RECALL_TITLES", "on").lower() not in ("off", "0", "false", "no")
+RECALL_GAZETTEER = os.environ.get("DEID_RECALL_GAZETTEER", "off").lower() in ("on", "1", "true", "yes")
+
+_TITLE_RE = re.compile(
+    r"\b(?:Dr|Mr|Mrs|Ms|Miss|Mx|Nurse|Doctor|Prof|Professor|RN|NP|PA)\.?\s+"
+    r"([A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){0,2})"
+)
+
+
+def _load_gazetteer():
+    """Known first/last names from Faker's bundled lists (no network)."""
+    try:
+        from faker.providers.person.en_US import Provider as P
+        names = set()
+        for attr in ("first_names", "first_names_male", "first_names_female",
+                     "first_names_nonbinary", "last_names"):
+            for n in getattr(P, attr, []) or []:
+                n = n.strip().lower()
+                if len(n) >= 2 and n.isalpha():
+                    names.add(n)
+        return names
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+_GAZETTEER = _load_gazetteer()
+
+
+def find_missed_names(text: str, entities: list) -> list:
+    """Recall net for names the NER missed. (1) Title-driven: a capitalized word after
+    Dr./Mr./Nurse/... is almost certainly a name (high precision). (2) Gazetteer
+    (opt-in, DEID_RECALL_GAZETTEER=on): a Title-case mid-sentence token that is a known
+    name. Skips spans already covered and whitelisted medical terms. Returns NEW
+    entities with offsets into `text`."""
+    covered = [(e["start"], e["end"]) for e in entities if "start" in e and "end" in e]
+
+    def is_covered(a, b):
+        return any(a < ce and cs < b for cs, ce in covered)
+
+    new = []
+    if RECALL_TITLES:
+        for m in _TITLE_RE.finditer(text):
+            base = m.start(1)
+            for wm in re.finditer(r"[A-Za-z'\-]+", m.group(1)):
+                ws, we, tok = base + wm.start(), base + wm.end(), wm.group(0)
+                if tok.lower() in MEDICAL_WHITELIST_LOWER or is_covered(ws, we):
+                    continue
+                new.append({"type": "NAME", "start": ws, "end": we, "text": tok, "score": 0.9})
+                covered.append((ws, we))
+    if RECALL_GAZETTEER and _GAZETTEER:
+        for wm in re.finditer(r"\b([A-Z][a-z]{2,})\b", text):
+            ws, we, tok = wm.start(1), wm.end(1), wm.group(1)
+            low = tok.lower()
+            if low not in _GAZETTEER or low in MEDICAL_WHITELIST_LOWER or is_covered(ws, we):
+                continue
+            prev = text[max(0, ws - 2):ws].strip()
+            if not prev or prev.endswith((".", "!", "?", ":", ";")):  # skip sentence-initial caps
+                continue
+            new.append({"type": "NAME", "start": ws, "end": we, "text": tok, "score": 0.6})
+            covered.append((ws, we))
+    return new
+
+
 # === API Endpoints ===
 @app.get("/deid/health", response_model=HealthResponse)
 async def health_check():
@@ -602,7 +666,10 @@ async def process_text(request: DeidRequest):
     
     # Extract entities (handles chunking automatically)
     entities, num_chunks = extract_entities(request.text)
-    
+
+    # Recall net: add names the NER missed (title-driven; opt-in gazetteer)
+    entities = entities + find_missed_names(request.text, entities)
+
     # Filter out whitelisted medical terms (prevents false positives)
     entities = filter_whitelisted_entities(entities)
 
@@ -637,11 +704,14 @@ async def process_batch(request: BatchRequest):
         tokens = tokenizer.encode(note, add_special_tokens=True)
         
         entities, num_chunks = extract_entities(note)
+        # Recall net: add names the NER missed (title-driven; opt-in gazetteer)
+        entities = entities + find_missed_names(note, entities)
         # Filter out whitelisted medical terms
         entities = filter_whitelisted_entities(entities)
+        name_map = resolve_names(note, entities)
         # Use seed + index for reproducibility across batch
         seed = request.seed + i if request.seed else None
-        deidentified = deidentify_text(note, entities, seed)
+        deidentified = deidentify_text(note, entities, seed, name_map=name_map)
         
         results.append(DeidResponse(
             deidentified_text=deidentified,

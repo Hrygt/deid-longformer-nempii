@@ -743,6 +743,38 @@ class ClinicalDeidentifier:
 
 # === Utility for batch processing ===
 
+def _split_name_spans(entities: list, text: str) -> list:
+    """Split a NAME/FIRST/LAST span that swallowed a sentence boundary ("Lee. Whitehead"
+    -> two names) and tighten each piece to its alpha edges, so the period and the second
+    person's surrogate stay distinct (and "Lee" keys consistently with other "Lee"s).
+    A single letter before the period (a middle initial like "A. Grant") is NOT a
+    boundary, so initials are preserved."""
+    out = []
+    for ent in entities:
+        if ent.get("type") not in ("NAME", "FIRST_NAME", "LAST_NAME"):
+            out.append(ent)
+            continue
+        s = ent["start"]
+        raw = text[s:ent["end"]]
+        cuts = [0]
+        for m in re.finditer(r"(?<=[A-Za-z]{2})\.\s+", raw):
+            cuts.append(m.end())
+        cuts.append(len(raw))
+        pieces = []
+        for a, b in zip(cuts[:-1], cuts[1:]):
+            la, rb = a, b
+            while la < rb and not raw[la].isalpha():
+                la += 1
+            while rb > la and not raw[rb - 1].isalpha():
+                rb -= 1
+            if rb > la:
+                ne = dict(ent)
+                ne["start"], ne["end"], ne["text"] = s + la, s + rb, text[s + la:s + rb]
+                pieces.append(ne)
+        out.extend(pieces if pieces else [ent])
+    return out
+
+
 def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict = None) -> str:
     """
     Replace entities in text with surrogate data.
@@ -767,7 +799,10 @@ def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict 
     # Pre-process: Combine adjacent FIRST_NAME/LAST_NAME into single NAME entities
     # This ensures "Sarah" + "Johnson" gets same cache key as "Sarah Elizabeth Johnson"
     entities = _combine_adjacent_name_entities(entities, text)
-    
+
+    # Split spans that swallowed a sentence boundary ("Lee. Whitehead") and tighten edges
+    entities = _split_name_spans(entities, text)
+
     # Sort by start position (reverse) for safe replacement
     sorted_entities = sorted(entities, key=lambda x: x["start"], reverse=True)
     
