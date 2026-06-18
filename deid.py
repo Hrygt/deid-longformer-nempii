@@ -207,14 +207,20 @@ class ClinicalDeidentifier:
         self._current_location = None  # For geographic consistency
         # Track generated full names for first/last consistency
         self._full_name_cache = {}
-        
+        # Per-token name caches: the same given/surname token always maps to the
+        # same fake, so "Veronica Brown", "Veronica", and "Brown" stay consistent.
+        self._first_tokens = {}
+        self._last_tokens = {}
+
     def reset_cache(self):
         """Call between documents to reset consistency caches."""
         self._cache = {}
         self._date_shift = random.randint(-365, -30)  # Shift 1-12 months back
         self._current_location = None
         self._full_name_cache = {}
-    
+        self._first_tokens = {}
+        self._last_tokens = {}
+
     def _get_cached(self, original: str, entity_type: str, generator_fn):
         """Ensure consistent replacement within a document."""
         # Use normalized key for names so variants map to same fake
@@ -239,22 +245,63 @@ class ClinicalDeidentifier:
         else:
             return replacement
     
+    _NAME_TITLES = frozenset({
+        "dr", "mr", "mrs", "ms", "miss", "prof", "md", "do", "rn", "np", "pa",
+        "phd", "jr", "sr", "ii", "iii", "iv",
+    })
+
+    def _fake_first(self, token: str) -> str:
+        t = re.sub(r"[^a-z]", "", token.lower())
+        if not t:
+            return token
+        if t not in self._first_tokens:
+            self._first_tokens[t] = self.fake.first_name()
+        return self._first_tokens[t]
+
+    def _fake_last(self, token: str) -> str:
+        t = re.sub(r"[^a-z]", "", token.lower())
+        if not t:
+            return token
+        if t not in self._last_tokens:
+            self._last_tokens[t] = self.fake.last_name()
+        return self._last_tokens[t]
+
+    def _fake_name(self, text: str) -> str:
+        """Compose a full-name surrogate from per-token caches, so a full name and
+        its standalone first/last variants resolve to the SAME fake tokens."""
+        cleaned = re.sub(r"[^a-zA-Z,\s]", " ", text)
+        if "," in cleaned:  # "Last, First" form
+            last_part, _, first_part = cleaned.partition(",")
+            lasts = [p for p in last_part.split() if p.lower() not in self._NAME_TITLES]
+            firsts = [p for p in first_part.split() if p.lower() not in self._NAME_TITLES]
+            first = firsts[0] if firsts else ""
+            last = lasts[-1] if lasts else ""
+        else:
+            parts = [p for p in cleaned.split() if p.lower() not in self._NAME_TITLES]
+            if not parts:
+                return text
+            if len(parts) == 1:  # single token (e.g. "Mr. Watkins") -> surname
+                return self._fake_last(parts[0])
+            first, last = parts[0], parts[-1]
+        out = []
+        if first:
+            out.append(self._fake_first(first))
+        if last:
+            out.append(self._fake_last(last))
+        return " ".join(out) if out else self.fake.name()
+
     def replace(self, text: str, entity_type: str) -> str:
         """Replace detected PHI with realistic surrogate data."""
-        
-        # === NAMES ===
+
+        # === NAMES === (token-level caches keep first/last/full variants consistent)
         if entity_type == "FIRST_NAME":
-            replacement = self._get_cached(text, entity_type, self.fake.first_name)
-            return self._preserve_case(text, replacement)
-        
+            return self._preserve_case(text, self._fake_first(text))
+
         elif entity_type == "LAST_NAME":
-            replacement = self._get_cached(text, entity_type, self.fake.last_name)
-            return self._preserve_case(text, replacement)
-        
+            return self._preserve_case(text, self._fake_last(text))
+
         elif entity_type == "NAME":
-            # Full name - generate first + last
-            replacement = self._get_cached(text, entity_type, self.fake.name)
-            return self._preserve_case(text, replacement)
+            return self._preserve_case(text, self._fake_name(text))
         
         # === DATES ===
         elif entity_type == "DATE":
@@ -362,12 +409,13 @@ class ClinicalDeidentifier:
             shifted = dt + timedelta(days=self._date_shift)
             return shifted.strftime(fmt)
         
-        # Couldn't parse - apply consistent shift to a reference date
-        # This maintains temporal consistency even for unparseable dates
-        # Use a reference date and apply the same shift
-        reference_date = datetime(2025, 1, 15)  # Fixed reference
-        shifted = reference_date + timedelta(days=self._date_shift)
-        return shifted.strftime("%m/%d/%Y")
+        # Couldn't parse: derive a STABLE, DISTINCT fake from the text itself, so
+        # different unparseable dates never collapse onto a single placeholder
+        # (the old fixed reference made every unparseable date identical).
+        import hashlib
+        h = int(hashlib.md5(text.encode("utf-8")).hexdigest(), 16)
+        base = datetime(2025, 1, 15) + timedelta(days=self._date_shift)
+        return (base + timedelta(days=(h % 700) - 350)).strftime("%m/%d/%Y")
     
     def _generate_dob(self, text: str) -> str:
         """Generate realistic DOB preserving approximate age (±2 years)."""
@@ -484,7 +532,19 @@ class ClinicalDeidentifier:
                 return (dt, fmt)
             except ValueError:
                 pass
-        
+
+        # Robust fallback: dateutil handles separators/orders the explicit list
+        # misses (2024/11/05, 11.5.2024, "Nov 5 2024", "5 Nov 2024", etc.). Parsing
+        # here means the date gets a real consistent shift instead of the collapse
+        # fallback, so intervals across the chart are preserved.
+        try:
+            from dateutil import parser as _du
+            dt = _du.parse(text.strip())
+            if 1900 <= dt.year <= 2100:
+                return (dt, "%m/%d/%Y")
+        except Exception:
+            pass
+
         return None
     
     # === IDENTIFIER GENERATION ===
