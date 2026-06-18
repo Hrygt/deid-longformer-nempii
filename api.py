@@ -600,10 +600,16 @@ def find_missed_names(text: str, entities: list) -> list:
                 new.append({"type": "NAME", "start": ws, "end": we, "text": tok, "score": 0.9})
                 covered.append((ws, we))
     if RECALL_GAZETTEER and _GAZETTEER:
+        # Precision filter: a candidate whose lowercase form also occurs as a normal
+        # word in THIS document ("Day"/day, "White"/white, "Case"/case) is a common
+        # word, not a name. Real surnames almost never appear lowercased. This alone
+        # removed ~all gazetteer false positives on the June/May M&M corpora.
+        doc_lower = set(re.findall(r"\b[a-z]{2,}\b", text))
         for wm in re.finditer(r"\b([A-Z][a-z]{2,})\b", text):
             ws, we, tok = wm.start(1), wm.end(1), wm.group(1)
             low = tok.lower()
-            if low not in _GAZETTEER or low in MEDICAL_WHITELIST_LOWER or is_covered(ws, we):
+            if (low not in _GAZETTEER or low in MEDICAL_WHITELIST_LOWER
+                    or low in doc_lower or is_covered(ws, we)):
                 continue
             prev = text[max(0, ws - 2):ws].strip()
             if not prev or prev.endswith((".", "!", "?", ":", ";")):  # skip sentence-initial caps
