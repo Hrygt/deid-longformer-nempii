@@ -619,6 +619,51 @@ def find_missed_names(text: str, entities: list) -> list:
     return new
 
 
+def patient_sweep(text: str, entities: list) -> list:
+    """Once the patient is identifiable (the most-frequent name token), add entities for
+    every CAPITALIZED whole-word occurrence of the patient's first/last token that the
+    NER missed — e.g. it caught 'Grant' but left the adjacent 'Michael', or missed a
+    name in an emergency-contact/header field. Capitalized-only ('Grant'/'GRANT', not
+    the word 'grant') so common words aren't swept. Drives patient-name recall on long
+    notes toward 100%, which matters most for the M&M subject."""
+    from collections import Counter
+    firsts, lasts = Counter(), Counter()
+    for e in entities:
+        if e.get("type") not in ("FIRST_NAME", "LAST_NAME", "NAME"):
+            continue
+        w = [x for x in re.findall(r"[a-z]+", (e.get("text") or "").lower()) if x not in _TITLES]
+        if not w:
+            continue
+        if e["type"] == "FIRST_NAME":
+            firsts[w[0]] += 1
+        elif e["type"] == "LAST_NAME":
+            lasts[w[-1]] += 1
+        else:
+            if len(w) >= 2:
+                firsts[w[0]] += 1
+            lasts[w[-1]] += 1
+    pf = firsts.most_common(1)[0][0] if firsts else None
+    pl = lasts.most_common(1)[0][0] if lasts else None
+    covered = [(e["start"], e["end"]) for e in entities if "start" in e]
+
+    def is_cov(a, b):
+        return any(a < ce and cs < b for cs, ce in covered)
+
+    new = []
+    for tok, typ in ((pf, "FIRST_NAME"), (pl, "LAST_NAME")):
+        if not tok or len(tok) < 2 or tok in MEDICAL_WHITELIST_LOWER:
+            continue
+        for m in re.finditer(r"\b" + re.escape(tok) + r"\b", text, re.I):
+            if m.group(0).islower():  # skip the common-word lowercase form
+                continue
+            ws, we = m.span()
+            if is_cov(ws, we):
+                continue
+            new.append({"type": typ, "start": ws, "end": we, "text": m.group(0), "score": 0.95})
+            covered.append((ws, we))
+    return new
+
+
 # === API Endpoints ===
 @app.get("/deid/health", response_model=HealthResponse)
 async def health_check():
@@ -679,6 +724,9 @@ async def process_text(request: DeidRequest):
     # Filter out whitelisted medical terms (prevents false positives)
     entities = filter_whitelisted_entities(entities)
 
+    # Sweep NER-missed occurrences of the patient's own name tokens (recall safety net)
+    entities = entities + patient_sweep(request.text, entities)
+
     # Resolve person-name identities (coref + sex-matched surrogates); {} = fall back.
     name_map = resolve_names(request.text, entities)
 
@@ -714,6 +762,7 @@ async def process_batch(request: BatchRequest):
         entities = entities + find_missed_names(note, entities)
         # Filter out whitelisted medical terms
         entities = filter_whitelisted_entities(entities)
+        entities = entities + patient_sweep(note, entities)
         name_map = resolve_names(note, entities)
         # Use seed + index for reproducibility across batch
         seed = request.seed + i if request.seed else None

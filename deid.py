@@ -822,7 +822,21 @@ def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict 
         replacement = deid.replace(entity["text"], entity_type)
         result = result[:entity["start"]] + replacement + result[entity["end"]:]
     
+    # Patient-token backstop: name_map carries the resolved patient surrogate. The NER
+    # sometimes DETECTS the patient name but the replacement still leaves a token (covered
+    # by a DATE/DATE_TIME span, or a partial "Michael <mid> Grant" replacement). Sweep any
+    # CAPITALIZED surviving occurrence of the patient's own first/last token so the M&M
+    # subject's name cannot leak. Lowercase forms (common words) are left untouched.
+    for _kind in ("first", "last"):
+        for _orig, _surr in ((name_map or {}).get(_kind) or {}).items():
+            if len(_orig) >= 2:
+                result = re.sub(
+                    r"\b" + re.escape(_orig) + r"\b",
+                    lambda m, s=_surr: m.group(0) if m.group(0).islower() else s,
+                    result, flags=re.I,
+                )
+
     # Post-process DOB line(s) to keep a single clean date
     result = _clean_dob_lines(result)
-    
+
     return result
