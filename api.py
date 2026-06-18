@@ -558,6 +558,15 @@ _TITLE_RE = re.compile(
     r"([A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){0,2})"
 )
 
+# Credential-AFTER a name ("Robert Smith, MD", "Garcia, Taylor, RN"): a comma before the
+# credential keeps precision high. Catches provider names the NER missed in this format
+# (the title-BEFORE pass above does not see them). Comma required, so the verb "do" / the
+# view "PA" don't false-match.
+_CRED_RE = re.compile(
+    r"\b([A-Z][a-zA-Z'\-]+(?:,?\s+[A-Z][a-zA-Z'\-]+){0,2})\s*,\s*"
+    r"(?:RN|LPN|MD|DO|NP|DNP|APRN|PA-C|PharmD|RPh|MSW|LCSW|LSW|DPM|DDS|CRNA|CNM|MBBS|FNP|AGNP|ACNP)\b"
+)
+
 
 def _load_gazetteer():
     """Known first/last names from Faker's bundled lists (no network)."""
@@ -591,14 +600,15 @@ def find_missed_names(text: str, entities: list) -> list:
 
     new = []
     if RECALL_TITLES:
-        for m in _TITLE_RE.finditer(text):
-            base = m.start(1)
-            for wm in re.finditer(r"[A-Za-z'\-]+", m.group(1)):
-                ws, we, tok = base + wm.start(), base + wm.end(), wm.group(0)
-                if tok.lower() in MEDICAL_WHITELIST_LOWER or is_covered(ws, we):
-                    continue
-                new.append({"type": "NAME", "start": ws, "end": we, "text": tok, "score": 0.9})
-                covered.append((ws, we))
+        for rx in (_TITLE_RE, _CRED_RE):  # name BEFORE a title, and name BEFORE a credential
+            for m in rx.finditer(text):
+                base = m.start(1)
+                for wm in re.finditer(r"[A-Za-z'\-]+", m.group(1)):
+                    ws, we, tok = base + wm.start(), base + wm.end(), wm.group(0)
+                    if len(tok) < 2 or tok.lower() in MEDICAL_WHITELIST_LOWER or is_covered(ws, we):
+                        continue
+                    new.append({"type": "NAME", "start": ws, "end": we, "text": tok, "score": 0.9})
+                    covered.append((ws, we))
     if RECALL_GAZETTEER and _GAZETTEER:
         # Precision filter: a candidate whose lowercase form also occurs as a normal
         # word in THIS document ("Day"/day, "White"/white, "Case"/case) is a common

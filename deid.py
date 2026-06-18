@@ -92,13 +92,18 @@ def _merge_adjacent_date_entities(entities: list, text: str) -> list:
             next_ent = sorted_ents[j]
             # Accept any date-type entity or even short gaps
             if next_ent["type"] not in date_types:
-                # Check if there's a small gap that looks like part of a date
                 gap = next_ent["start"] - group_end
                 if gap > 3:  # Too far apart
                     break
-                # Skip non-date entities in the gap
-                j += 1
-                continue
+                # Fold a TIME the model split out of the date into the SAME span so the
+                # date+time shifts as one unit; otherwise the pieces shift independently
+                # and run together ("08/14/2025" + "5:54" -> "08/14/202554"). Don't absorb
+                # other entity types (could hide a real identifier sitting next to a date).
+                if next_ent["type"] == "TIME":
+                    group_end = max(group_end, next_ent["end"])
+                    j += 1
+                    continue
+                break
             
             gap = next_ent["start"] - group_end
             # Allow gap of up to 1 char for slashes/dashes that might not be entities
@@ -835,6 +840,12 @@ def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict 
                     lambda m, s=_surr: m.group(0) if m.group(0).islower() else s,
                     result, flags=re.I,
                 )
+
+    # Safety net: if any date fragments still shifted independently and ran together,
+    # drop digits trailing a complete date ("08/14/202554" -> "08/14/2025"). This only
+    # ever matches an already-malformed value (a real date is not immediately followed
+    # by bare digits).
+    result = re.sub(r"(\b\d{1,2}/\d{1,2}/\d{4})\d+", r"\1", result)
 
     # Post-process DOB line(s) to keep a single clean date
     result = _clean_dob_lines(result)
