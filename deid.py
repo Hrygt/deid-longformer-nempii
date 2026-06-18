@@ -251,7 +251,10 @@ class ClinicalDeidentifier:
     })
 
     def _fake_first(self, token: str) -> str:
-        t = re.sub(r"[^a-z]", "", token.lower())
+        # Key by the FIRST real name word so "Michael" and "Michael A" collapse the
+        # same; titles are dropped so "Dr Michael" -> "michael".
+        words = [w for w in re.findall(r"[a-z]+", token.lower()) if w not in self._NAME_TITLES]
+        t = words[0] if words else ""
         if not t:
             return token
         if t not in self._first_tokens:
@@ -260,7 +263,10 @@ class ClinicalDeidentifier:
         return self._first_tokens[t]
 
     def _fake_last(self, token: str) -> str:
-        t = re.sub(r"[^a-z]", "", token.lower())
+        # Key by the LAST real name word so "A. Grant", "Grant", "Mr. Grant" all map
+        # to the same surname surrogate (was: stripped to "agrant" vs "grant").
+        words = [w for w in re.findall(r"[a-z]+", token.lower()) if w not in self._NAME_TITLES]
+        t = words[-1] if words else ""
         if not t:
             return token
         if t not in self._last_tokens:
