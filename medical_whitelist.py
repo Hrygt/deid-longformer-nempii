@@ -26,6 +26,23 @@ MEDICAL_WHITELIST = {
     "Father",
     "Son",
     "Daughter",
+    # === MEDICAL EPONYM SURNAMES (clinical terms that are also surnames) ===
+    # ULTRA-DISTINCTIVE eponyms ONLY: names essentially never a real US patient
+    # surname, so whitelisting carries ~zero leak risk. Measured 2026-06: the NER
+    # already preserves the plausible-surname eponyms (Parkinson, Cushing, Crohn,
+    # Hodgkin, Glasgow, Gleason, Sjogren, Raynaud, Charcot, Murphy...), so those are
+    # DELIBERATELY EXCLUDED — whitelisting them would only add leak risk for a patient
+    # actually named that, with no benefit. This narrow set fixes the rare residual
+    # garble (e.g. "Homan sign" -> a fake name) with no downside. Gazetteer stays off.
+    "Babinski", "Kernig", "Brudzinski", "Wernicke", "Korsakoff", "Boerhaave",
+    "Dupuytren", "Chvostek", "Trousseau", "Rovsing", "Kehr", "Phalen", "Tinel",
+    "McBurney", "Lhermitte", "Courvoisier", "Kussmaul", "Buerger", "Henoch",
+    "Schonlein", "Alport", "DeQuervain", "Duchenne", "Marfan", "Ehlers", "Danlos",
+    "Klinefelter", "DiGeorge", "Pancoast", "Wegener", "Goodpasture", "Caprini",
+    "Krukenberg", "Takayasu", "Behcet", "Marjolin", "Troisier", "Kartagener",
+    "Wenckebach", "Brugada", "Prinzmetal", "Eisenmenger", "Zollinger", "Friderichsen",
+    "Crigler", "Najjar", "Bartter", "Gitelman", "Liddle", "Caroli", "Wallenberg",
+    "Homans", "Homan",
     # === LAB VALUES & CHEMISTRY ===
     "Anion Gap",
     "Base Excess",
