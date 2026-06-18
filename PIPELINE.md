@@ -76,13 +76,19 @@ recall; on) · `DEID_RECALL_GAZETTEER` (off) · `DEID_MODEL_PATH`
 
 ## Deploy & persistence
 
-- Service: `clinical-deid.service` on GPU box `i-0cbcf0d83ab29ff96`, `:8001`, venv
-  `/opt/pytorch`, code in `/opt/clinical-deid/`.
-- The box **re-clones this repo on its nightly 11 PM reboot** → every fix MUST be on
-  `origin/main` or it's lost. (Repo renamed to `deid-longformer-nempii`; old clone
-  URL works via redirect.)
-- Live deploy: base64 the changed files over SSM to `/opt/clinical-deid/`, `python
-  -m py_compile`, `systemctl restart clinical-deid`, smoke-test `/deid/health`.
+- Service: `clinical-deid.service` on the GPU box, `:8001`, venv `/opt/pytorch`, code
+  in `/opt/clinical-deid/`.
+- **The box is ephemeral.** An ASG (`cpt-dnn-service-asg`, scheduled 1↔0) terminates +
+  relaunches a fresh instance each morning → **the instance ID changes daily** (find
+  it via the EIP `eipalloc-015559bd652771d48` / `describe-addresses`, or the
+  `cpt-dnn-service` Name tag). Boot = AMI `ami-0740ca890dd056d00` + `bootstrap.sh`,
+  which **`aws s3 sync`s the code from
+  `s3://cpt-dnn-model-artifacts-675138611834/clinical-deid/app/`** — NOT GitHub.
+- **To persist a fix:** upload the changed files to that S3 prefix (the next boot
+  syncs them). To also apply NOW on the running instance: presigned-S3 the files to
+  `/opt/clinical-deid/` (base64-over-SSM fails for the larger files), `py_compile`,
+  `systemctl restart clinical-deid`, smoke-test `/deid/health`. An SSM-only deploy is
+  LOST on the next relaunch. GitHub is version control, not the boot source.
 
 ## PHI handling when testing
 
