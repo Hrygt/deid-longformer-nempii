@@ -21,6 +21,14 @@ import random
 import re
 from typing import Optional, Tuple
 
+# Whitelist of clinical terms (lowercased) used only to flag surrogate-name collisions
+# in the optional re-identification map. Guarded import so existing callers that don't
+# have the module on path keep working (the flag just degrades to "no collision known").
+try:
+    from medical_whitelist import MEDICAL_WHITELIST_LOWER
+except Exception:  # noqa: BLE001
+    MEDICAL_WHITELIST_LOWER = set()
+
 
 def normalize_name(name: str) -> str:
     """
@@ -780,17 +788,54 @@ def _split_name_spans(entities: list, text: str) -> list:
     return out
 
 
-def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict = None) -> str:
+def _build_surrogate_map(subs: list) -> dict:
+    """Assemble the original<->surrogate pairs that were ACTUALLY substituted, for
+    output-side re-identification. This is additive observation only — it reads values
+    the scrubber already produced and never affects the de-identified text.
+
+    Each pair carries a `collision` flag: True when the SURROGATE token matches a
+    medical/common whitelist word (computed against the surrogate, never the original),
+    so the downstream re-id pass can refuse to swap a fake name that doubles as a real
+    clinical word. Token-level name pairs are emitted too ("Anjali Patel"/"Megan Riley"
+    yields "Patel"/"Riley") so a lone surname paraphrased downstream stays recoverable.
+    """
+    pairs = {}
+
+    def add(orig: str, surr: str, etype: str):
+        orig, surr = (orig or "").strip(), (surr or "").strip()
+        if not orig or not surr or orig == surr:
+            return
+        collision = any(tok in MEDICAL_WHITELIST_LOWER for tok in surr.lower().split())
+        pairs[(orig.lower(), surr.lower(), etype)] = {
+            "original": orig, "surrogate": surr, "type": etype, "collision": collision,
+        }
+
+    for orig, surr, etype in subs:
+        add(orig, surr, etype)
+        if etype in ("NAME", "FIRST_NAME", "LAST_NAME"):
+            o_tok, s_tok = orig.split(), surr.split()
+            # Only split into token pairs when counts align, so tokens can't be mis-paired.
+            if len(o_tok) == len(s_tok) and len(o_tok) > 1:
+                for i, (ot, st) in enumerate(zip(o_tok, s_tok)):
+                    add(ot, st, "FIRST_NAME" if i == 0 else "LAST_NAME")
+
+    return {"version": 1, "pairs": list(pairs.values())}
+
+
+def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict = None,
+                    return_map: bool = False):
     """
     Replace entities in text with surrogate data.
-    
+
     Args:
         text: Original clinical text
         entities: List of dicts with 'type', 'start', 'end', 'text' keys
         seed: Random seed for reproducibility
-    
+        return_map: When True, return (deidentified_text, surrogate_map) instead of
+            just the text. The map is additive and does not change scrubbing.
+
     Returns:
-        De-identified text
+        De-identified text, or (text, surrogate_map) when return_map=True.
     """
     deid = ClinicalDeidentifier(seed=seed)
     deid.reset_cache()
@@ -810,7 +855,9 @@ def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict 
 
     # Sort by start position (reverse) for safe replacement
     sorted_entities = sorted(entities, key=lambda x: x["start"], reverse=True)
-    
+
+    # (original, surrogate, type) actually substituted — feeds the optional re-id map.
+    _subs = []
     result = text
     for entity in sorted_entities:
         entity_type = entity["type"]
@@ -825,6 +872,7 @@ def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict 
                 entity_type = "DATE_OF_BIRTH"
         
         replacement = deid.replace(entity["text"], entity_type)
+        _subs.append((entity["text"], replacement, entity_type))
         result = result[:entity["start"]] + replacement + result[entity["end"]:]
     
     # Patient-token backstop: name_map carries the resolved patient surrogate. The NER
@@ -835,11 +883,15 @@ def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict 
     for _kind in ("first", "last"):
         for _orig, _surr in ((name_map or {}).get(_kind) or {}).items():
             if len(_orig) >= 2:
-                result = re.sub(
-                    r"\b" + re.escape(_orig) + r"\b",
-                    lambda m, s=_surr: m.group(0) if m.group(0).islower() else s,
-                    result, flags=re.I,
-                )
+                _bk_type = "FIRST_NAME" if _kind == "first" else "LAST_NAME"
+
+                def _bk(m, s=_surr, t=_bk_type):
+                    if m.group(0).islower():
+                        return m.group(0)
+                    _subs.append((m.group(0), s, t))  # record the actual backstop swap
+                    return s
+
+                result = re.sub(r"\b" + re.escape(_orig) + r"\b", _bk, result, flags=re.I)
 
     # Safety net: if any date fragments still shifted independently and ran together,
     # drop digits trailing a complete date ("08/14/202554" -> "08/14/2025"). This only
@@ -850,4 +902,6 @@ def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict 
     # Post-process DOB line(s) to keep a single clean date
     result = _clean_dob_lines(result)
 
+    if return_map:
+        return result, _build_surrogate_map(_subs)
     return result

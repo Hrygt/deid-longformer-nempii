@@ -52,11 +52,13 @@ app.add_middleware(
 class DeidRequest(BaseModel):
     text: str = Field(..., description="Clinical note text to de-identify")
     return_entities: bool = Field(False, description="Include detected entities in response")
+    return_map: bool = Field(False, description="Include the original<->surrogate map for output-side re-identification")
     seed: Optional[int] = Field(None, description="Random seed for reproducible replacements")
 
 class DeidResponse(BaseModel):
     deidentified_text: str
     entities: Optional[list] = None
+    surrogate_map: Optional[dict] = None
     token_count: int
     processing_time_ms: float
     chunks_processed: int = 1
@@ -740,14 +742,20 @@ async def process_text(request: DeidRequest):
     # Resolve person-name identities (coref + sex-matched surrogates); {} = fall back.
     name_map = resolve_names(request.text, entities)
 
-    # De-identify
-    deidentified = deidentify_text(request.text, entities, request.seed, name_map=name_map)
-    
+    # De-identify (optionally capturing the original<->surrogate map for output-side re-id)
+    if request.return_map:
+        deidentified, surrogate_map = deidentify_text(
+            request.text, entities, request.seed, name_map=name_map, return_map=True)
+    else:
+        deidentified = deidentify_text(request.text, entities, request.seed, name_map=name_map)
+        surrogate_map = None
+
     processing_time = (time.time() - start_time) * 1000
-    
+
     return DeidResponse(
         deidentified_text=deidentified,
         entities=entities if request.return_entities else None,
+        surrogate_map=surrogate_map,
         token_count=len(tokens),
         processing_time_ms=round(processing_time, 2),
         chunks_processed=num_chunks,
