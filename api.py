@@ -385,31 +385,61 @@ def merge_adjacent_entities(entities: list[dict], text: str, max_gap: int = 2) -
     return merged
 
 
+def _drop_name_subword_fragments(text: str, entities: list) -> list:
+    """NER span-sanity guard: drop *_NAME entities that are mid-token sub-fragments of a longer
+    LOWERCASE-continuing word — the NER's subword surrogation false-positive that mangles
+    medication tokens BEFORE the grader sees them (clozapine->'cloz'->raymondozapine,
+    Valium->'Val', methadone->'m'/'meth'). Dropping the fragment lets the drug token survive.
+
+    CRITERION (length-INDEPENDENT; fragments are 1-4 chars so a length rule misses them): drop
+    iff the character immediately AFTER the span (text[end]) is a LOWERCASE ascii letter — i.e.
+    the span is a prefix cutting into a longer lowercase word. A real name boundary is never
+    that: it is whitespace / punctuation, OR a camelCase UPPERCASE (the run-together
+    'JohnSmith' -> NER spans 'John'(+'S') and 'Smith'(+' ') is PRESERVED — 'S' is uppercase and
+    'Smith' has a right boundary). The left side is deliberately NOT checked: 'Smith' is
+    preceded by the lowercase 'n' of 'John', so a left-side lowercase test would wrongly drop a
+    real name (proven by the B.1 JohnSmith probe). Empirically every observed drug fragment is a
+    prefix continuing lowercase, so the right-continuation test catches them all leak-free.
+
+    *_NAME types ONLY — never touches SSN / MRN / DOB / DATE / ADDRESS / etc."""
+    NAME_TYPES = ("FIRST_NAME", "LAST_NAME", "NAME")
+    out = []
+    for e in entities:
+        if e.get("type") in NAME_TYPES:
+            en = e.get("end")
+            if en is not None and en < len(text) and ("a" <= text[en] <= "z"):
+                continue  # mid-lowercase-word fragment -> drop (the subword surrogation bug)
+        out.append(e)
+    return out
+
+
 def extract_entities(text: str) -> tuple[list[dict], int]:
     """
     Extract entities from text, automatically chunking if needed.
     Returns (entities, num_chunks).
     """
     chunks = chunk_text(text)
-    
+
     if len(chunks) == 1:
         # No chunking needed
-        return extract_entities_single(text), 1
-    
+        return _drop_name_subword_fragments(text, extract_entities_single(text)), 1
+
     # Process each chunk
     all_chunk_entities = []
     for chunk in chunks:
         chunk_entities = extract_entities_single(chunk["text"])
         all_chunk_entities.append(chunk_entities)
-    
+
     # Merge entities from all chunks
     merged_entities = merge_entities(all_chunk_entities, chunks)
-    
+
     # Update entity text from original document (in case of boundary issues)
     for entity in merged_entities:
         entity["text"] = text[entity["start"]:entity["end"]]
-    
-    return merged_entities, len(chunks)
+
+    # NER span-sanity guard (subword surrogation FP) — applied to the FINAL spans (offsets
+    # into the original text), so it is measured by deid_score.py (which calls extract_entities).
+    return _drop_name_subword_fragments(text, merged_entities), len(chunks)
 
 
 def filter_whitelisted_entities(entities: list[dict]) -> list[dict]:
