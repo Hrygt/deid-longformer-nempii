@@ -374,7 +374,30 @@ MEDICAL_WHITELIST = {
     "Intramuscular Injection",
     "Subcutaneous Injection",
     "Topical Application",
-    
+
+    # === CONTROLLED-SUBSTANCE DRUG NAMES (full-word NER name-FP fix) ===
+    # Short, name-like medication tokens (esp. brands at a clause boundary) get mis-tagged
+    # FIRST_NAME/LAST_NAME and surrogated to fake names BEFORE the grader sees them
+    # (Ativan->William, Versed->Amanda, Valium->a fake name, Dolophine->a fake name),
+    # which defeats the downstream parenteral-controlled IM-adjudicate detector. The
+    # exact-match filter (filter_whitelisted_entities) drops these pre-surrogation.
+    # SCOPE: prophylactic — the full controlled-substance lexicon (brands + generics); EVERY
+    # token surname-checked against the faker first/last-name lists (0 collisions; none is a
+    # plausible US patient surname, consistent with the eponym-exclusion discipline above).
+    # CASE: MEDICAL_WHITELIST_LOWER handles all casings.
+    # BOUNDARY: this CANNOT catch the SUBWORD mode (Valium->"Val", methadone->"m"/"meth") —
+    # that is the NER span-sanity guard's job (a separate fix). Do NOT trim the "survive in
+    # one context" tokens: the FP is context-sensitive, so they are forward defense.
+    # -- opioids (CII; butorphanol is a CIV mixed agonist-antagonist) --
+    "morphine", "hydromorphone", "fentanyl", "oxymorphone", "meperidine", "methadone",
+    "sufentanil", "remifentanil", "butorphanol",
+    # -- benzodiazepines (CIV) --
+    "lorazepam", "midazolam", "diazepam", "chlordiazepoxide",
+    # -- other (ketamine CIII; barbiturates CII/CIV) --
+    "ketamine", "secobarbital", "phenobarbital",
+    # -- brand names (the dominant full-word failers) --
+    "Ativan", "Versed", "Valium", "Dilaudid", "Sublimaze", "Demerol", "Dolophine", "Luminal",
+
     # === CLINICAL STATUS ===
     "Present On",
     "Present Illness",
