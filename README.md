@@ -149,6 +149,27 @@ curl -X POST http://localhost:8001/deidentify \
   -d '{"text": "Patient John Smith, DOB 01/15/1957"}'
 ```
 
+#### Re-identification map (`return_map`)
+
+`/deid/process` accepts **`return_map`** (bool, default `false`) — **independent of `return_entities`**. When `true`, the response includes a `surrogate_map` that lets a trusted downstream caller restore the real entities in its *output* (the model still only ever sees scrubbed text):
+
+```jsonc
+// POST /deid/process  { "text": "...", "return_map": true }
+{
+  "deidentified_text": "... Dr. Dawn Williams ...",
+  "surrogate_map": {
+    "version": 1,
+    "pairs": [
+      {"original": "Anjali Patel", "surrogate": "Dawn Williams", "type": "NAME",       "collision": false},
+      {"original": "Anjali",       "surrogate": "Dawn",          "type": "FIRST_NAME", "collision": false},
+      {"original": "Patel",        "surrogate": "Williams",      "type": "LAST_NAME",  "collision": false}
+    ]
+  }
+}
+```
+
+`pairs` includes full-name **and** token-level name pairs (so a lone surname can be restored). `collision` is `true` when the **surrogate** token matches the medical/common whitelist (the caller should then skip it). `return_map` is off by default, so existing callers are unaffected. Consumed by the CPT grader's re-identification overlay.
+
 ## Training
 
 To train on your own data:
