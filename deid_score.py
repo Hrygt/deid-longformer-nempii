@@ -33,7 +33,9 @@ def overlaps(a0, a1, b0, b1):
     return a0 < b1 and b0 < a1
 
 
-ds = load_dataset("nvidia/Nemotron-PII", split="test", streaming=True)
+NEMOTRON_REV = os.environ.get("NEMOTRON_REV", "b70ffaf5ff39e079776134c5bf4381f00a9fd1ed")
+ds = load_dataset("nvidia/Nemotron-PII", split="test", revision=NEMOTRON_REV, streaming=True)
+print(f"Nemotron-PII test @ rev {NEMOTRON_REV[:12]} | model={os.environ['DEID_MODEL_PATH']}")
 
 gold_total, rec_aug, rec_ner = Counter(), Counter(), Counter()
 h_gold, h_rec = Counter(), Counter()
