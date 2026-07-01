@@ -73,3 +73,6 @@ PROJECT_DOCUMENTATION.md
 *.tmp
 *.temp
 CONTINUATION_PROMPT.md
+
+# runtime deploy fingerprint (written by user-data / reconcile on the box)
+VERSION
