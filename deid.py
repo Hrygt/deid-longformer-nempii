@@ -788,6 +788,63 @@ def _split_name_spans(entities: list, text: str) -> list:
     return out
 
 
+# Identifier families whose canonical (and surrogate) form is ALWAYS alphanumeric at both
+# edges, so a non-alphanumeric character at a detected span edge is NER over-match and never
+# part of the identifier. Enumerated from labels.ENTITY_TYPES: the direct-identifier number
+# types (SSN / MEDICAL_RECORD_NUMBER / HEALTH_PLAN_BENEFICIARY_NUMBER) plus the "Other IDs"
+# block. PHONE_NUMBER / FAX_NUMBER are DELIBERATELY EXCLUDED — their surrogate legitimately
+# begins with "(", so trimming a leading paren would corrupt them. NAME / DATE / AGE / geo
+# families are out of scope (NAME edges are handled by _split_name_spans).
+_IDENTIFIER_TYPES = frozenset({
+    "SSN",
+    "MEDICAL_RECORD_NUMBER",
+    "HEALTH_PLAN_BENEFICIARY_NUMBER",
+    "ACCOUNT_NUMBER",
+    "CUSTOMER_ID",
+    "EMPLOYEE_ID",
+    "UNIQUE_ID",
+    "BIOMETRIC_IDENTIFIER",
+    "CERTIFICATE_LICENSE_NUMBER",
+})
+
+
+def _trim_identifier_span_edges(entities: list, raw_text: str) -> list:
+    """Tighten identifier-family spans (MRN/SSN/account/...) to their alphanumeric edges.
+    The NER occasionally over-matches an identifier span's LEFT (or right) boundary into an
+    adjacent unit/punctuation char (e.g. "% MRN 12594309"); because substitution is a faithful
+    offset slice with no delimiter guarantee, that swallowed char is consumed and the surrogate
+    fuses into neighboring text ("EF 60-69MRN12594309 ..."). Advancing start past leading
+    non-alphanumerics and retreating end past trailing non-alphanumerics leaves only the
+    identifier itself. EDGES ONLY — interior characters (SSN hyphens, MRN prefixes) are
+    untouched. A span that trims to empty held no identifier and is DROPPED, so we never
+    substitute an empty span. NAME/DATE families are out of scope (NAME: _split_name_spans)."""
+    out = []
+    for ent in entities:
+        if ent.get("type") not in _IDENTIFIER_TYPES:
+            out.append(ent)
+            continue
+        s, e = ent["start"], ent["end"]
+        while s < e and not raw_text[s].isalnum():
+            s += 1
+        while e > s and not raw_text[e - 1].isalnum():
+            e -= 1
+        if s >= e:
+            # Degenerate: the detected span was all non-alphanumeric — no identifier to
+            # redact. Drop it rather than emit a garbage surrogate. (Matches the pipeline's
+            # print() diagnostic idiom; other drops — subword fragments, whitelist — are silent.)
+            print(f"[deid] dropped degenerate {ent.get('type')} span "
+                  f"{ent['start']}:{ent['end']} {raw_text[ent['start']:ent['end']]!r} "
+                  f"(no alphanumeric content)")
+            continue
+        if (s, e) != (ent["start"], ent["end"]):
+            ne = dict(ent)
+            ne["start"], ne["end"], ne["text"] = s, e, raw_text[s:e]
+            out.append(ne)
+        else:
+            out.append(ent)
+    return out
+
+
 def _build_surrogate_map(subs: list) -> dict:
     """Assemble the original<->surrogate pairs that were ACTUALLY substituted, for
     output-side re-identification. This is additive observation only — it reads values
@@ -852,6 +909,11 @@ def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict 
 
     # Split spans that swallowed a sentence boundary ("Lee. Whitehead") and tighten edges
     entities = _split_name_spans(entities, text)
+
+    # Tighten identifier spans (MRN/SSN/account/...) to alphanumeric edges so an NER left/
+    # right over-match into an adjacent unit char ("% MRN 12594309") can't fuse the surrogate
+    # into neighboring text. Runs on every path reaching the reverse-slice loop below.
+    entities = _trim_identifier_span_edges(entities, text)
 
     # Sort by start position (reverse) for safe replacement
     sorted_entities = sorted(entities, key=lambda x: x["start"], reverse=True)

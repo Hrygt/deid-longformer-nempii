@@ -25,6 +25,23 @@ CHUNK_SIZE = 3500  # Leave room for special tokens
 CHUNK_OVERLAP = 256  # Token overlap between chunks
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+
+def _read_deployed_version() -> str:
+    """Return the deployed commit SHA written to the VERSION file at deploy time
+    (user-data captures `git rev-parse HEAD` before .git is discarded; the reconcile
+    path rewrites it on overlay). Degrades to "unknown" on ANY problem — missing file,
+    unreadable, or empty — and never raises, so /deid/health can never be broken by it."""
+    try:
+        path = os.environ.get("DEID_VERSION_FILE", "/opt/clinical-deid/VERSION")
+        with open(path) as f:
+            sha = f.read().strip()
+        return sha or "unknown"
+    except Exception:
+        return "unknown"
+
+
+DEPLOYED_VERSION = _read_deployed_version()
+
 # === Load Model (once at startup) ===
 print(f"Loading model from {MODEL_PATH} on {DEVICE}...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
@@ -90,6 +107,7 @@ class HealthResponse(BaseModel):
     max_tokens: int
     chunk_size: int
     chunk_overlap: int
+    version: str = "unknown"
 
 
 # === Chunking Logic ===
@@ -717,6 +735,7 @@ async def health_check():
         max_tokens=MAX_TOKENS,
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
+        version=DEPLOYED_VERSION,
     )
 
 
