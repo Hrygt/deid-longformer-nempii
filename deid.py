@@ -993,6 +993,115 @@ def _date_span_boundary(entities: list, text: str) -> list:
     return out
 
 
+# Identifier families whose surrogate is alphanumeric (a leading alpha prefix plus a digit run);
+# an alpha run continuing past the span edge is a word, not part of the identifier.
+_REPAIR_ID = frozenset({
+    "MEDICAL_RECORD_NUMBER", "SSN", "HEALTH_PLAN_BENEFICIARY_NUMBER", "ACCOUNT_NUMBER",
+    "CUSTOMER_ID", "EMPLOYEE_ID", "UNIQUE_ID", "BIOMETRIC_IDENTIFIER",
+    "CERTIFICATE_LICENSE_NUMBER",
+})
+# Geographic families in scope for under-match completion (from the recorded evidence: the
+# STREET_ADDRESS span "3214 KETH" truncated "KETHLEY" mid-word).
+_REPAIR_GEO = frozenset({"STREET_ADDRESS"})
+# Sub-run insurance is scoped to the IDENTIFIER families. The date families' sub-run fragments
+# (clock tails) are already owned by the Branch 6 SAFE veto (clock/tabular context) and, if
+# un-vetoed, the Branch 3 disciplined fallback; expanding a clock-time tail into the full clock
+# run and re-surrogating it would conflict with that fragment contract. The recorded R3 evidence
+# (note 13 "25" of "9625", note 2 "7" of "73084") is entirely MRN.
+_REPAIR_SUBRUN = _REPAIR_ID
+_ZIP4_TAIL_RE = re.compile(r"\d{5}-$")
+
+
+def _repair_identifier_spans(entities: list, text: str) -> list:
+    """Identifier/geo span repair (span layer), three rules keyed on digit-run/word-boundary
+    arithmetic. Runs after _split_name_spans, before _trim_identifier_span_edges, so rule 3's
+    expansion to the full digit run happens first; the expanded span is all-digit with
+    alphanumeric edges, so the edge trim is a no-op on it (they compose without conflict).
+
+    R1 over-match split (identifier families): if a letter continues immediately past the span
+       end, retreat the end past the trailing alpha to the last digit run, preserving a leading
+       alpha prefix; a span with no digit is a word fragment (site 7: the "M" of "MCHC") and is
+       DROPPED so the label survives.
+    R2 under-match completion (STREET_ADDRESS / geo): if an edge falls mid-word (alpha on both
+       sides), extend to the word boundary before surrogation (site 8a: "3214 KETH" ->
+       "3214 KETHLEY"). Fail-safe by construction: extension redacts more, never less.
+    R3 sub-run insurance (identifier families): a span that is a proper sub-run of a longer
+       contiguous digit run (hyphen/slash breaks a run) expands to the full run when the run is
+       <=6 digits, drops above the cap. Composition refinement (proven by the stacked assertion):
+       a ZIP+4 tail (run preceded by \\d{5}-) is DROPPED instead, because expanding surrogates
+       only the +4 as an MRN and strands the 5-digit ZIP prefix that the Branch 5 backstop cannot
+       re-generalize; dropping lets that backstop re-generalize the whole ZIP. A leading sub-run
+       (note-2 "7" of "73084") expands cleanly."""
+    out = []
+    for ent in entities:
+        t, s, e = ent.get("type"), ent.get("start"), ent.get("end")
+        if t not in _REPAIR_ID and t not in _REPAIR_GEO and t not in _REPAIR_SUBRUN:
+            out.append(ent)
+            continue
+        if s is None or e is None:
+            out.append(ent)
+            continue
+        span = text[s:e]
+
+        # R1: over-match split (identifier families). A real identifier of these families always
+        # has a digit run; a span with NO digit is a mis-tagged word ("M" of "MCHC" at site 7,
+        # a procedure name like "ESOPHAGOGASTRODUODENOSCOPY" tagged UNIQUE_ID) -> drop so the word
+        # survives verbatim instead of becoming a fake ID. A digit-bearing span whose edge sits
+        # inside an alpha run (letters continue into a word) retreats past the trailing alpha to
+        # its digit run, preserving a leading alpha prefix.
+        if t in _REPAIR_ID:
+            if not any(c.isdigit() for c in span):
+                print(f"[deid] id-span drop (no digit, not an identifier) {t} {s}:{e} {span!r}")
+                continue
+            if e < len(text) and text[e].isalpha():
+                ne = e
+                while ne > s and text[ne - 1].isalpha():
+                    ne -= 1
+                if ne != e and any(c.isdigit() for c in text[s:ne]):
+                    r = dict(ent); r["end"], r["text"] = ne, text[s:ne]
+                    print(f"[deid] id-span over-match trim {t} {s}:{e}->{s}:{ne} {span!r}->{r['text']!r}")
+                    out.append(r)
+                    continue
+
+        # R2: under-match completion (geo families) -- an edge inside an alpha word.
+        if t in _REPAIR_GEO:
+            ns, nend = s, e
+            if s > 0 and text[s - 1].isalpha() and s < len(text) and text[s].isalpha():
+                while ns > 0 and text[ns - 1].isalpha():
+                    ns -= 1
+            if e < len(text) and text[e].isalpha() and e > s and text[e - 1].isalpha():
+                while nend < len(text) and text[nend].isalpha():
+                    nend += 1
+            if (ns, nend) != (s, e):
+                r = dict(ent); r["start"], r["end"], r["text"] = ns, nend, text[ns:nend]
+                print(f"[deid] geo-span complete {t} {s}:{e}->{ns}:{nend} {span!r}->{r['text']!r}")
+                out.append(r)
+                continue
+
+        # R3: sub-run insurance (identifier/date families) -- proper sub-run of a digit run.
+        if t in _REPAIR_SUBRUN and span.isdigit():
+            a, z = s, e
+            while a > 0 and text[a - 1].isdigit():
+                a -= 1
+            while z < len(text) and text[z].isdigit():
+                z += 1
+            if (a, z) != (s, e):  # the span is a proper sub-run of a longer run
+                if _ZIP4_TAIL_RE.search(text[:a]):
+                    print(f"[deid] sub-run drop (ZIP+4 tail -> Branch 5 backstop) {t} {s}:{e} "
+                          f"run={text[a:z]!r}")
+                    continue
+                if (z - a) <= 6:
+                    r = dict(ent); r["start"], r["end"], r["text"] = a, z, text[a:z]
+                    print(f"[deid] sub-run expand {t} {s}:{e}->{a}:{z} {span!r}->{r['text']!r}")
+                    out.append(r)
+                    continue
+                print(f"[deid] sub-run drop (run {z - a}>6 digits) {t} {s}:{e} run={text[a:z]!r}")
+                continue
+
+        out.append(ent)
+    return out
+
+
 def _build_surrogate_map(subs: list) -> dict:
     """Assemble the original<->surrogate pairs that were ACTUALLY substituted, for
     output-side re-identification. This is additive observation only — it reads values
@@ -1154,6 +1263,12 @@ def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict 
 
     # Split spans that swallowed a sentence boundary ("Lee. Whitehead") and tighten edges
     entities = _split_name_spans(entities, text)
+
+    # Identifier/geo span repair: over-match split (drop the "M" of "MCHC"), under-match
+    # completion (extend "3214 KETH" to "KETHLEY"), sub-run insurance (expand/drop a digit
+    # sub-run; drop a ZIP+4 tail so the Branch 5 backstop owns the ZIP). Before the edge trim
+    # so rule 3's all-digit expansion composes with it as a no-op.
+    entities = _repair_identifier_spans(entities, text)
 
     # Tighten identifier spans (MRN/SSN/account/...) to alphanumeric edges so an NER left/
     # right over-match into an adjacent unit char ("% MRN 12594309") can't fuse the surrogate

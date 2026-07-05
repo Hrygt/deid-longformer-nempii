@@ -73,11 +73,14 @@ case("N17 state+ZIP5 'OK 74804'", "Addr: 1 Harrison St / Shawnee OK 74804", None
      lambda o, l: ("74804" not in o and bool(re.search(r"\bOK \d{5}\b", o)), "gone"))
 
 # ---- Leak shape C: truncated/fused ZIP. Note 13 (site 8): MRN over the +4 tail "25". ----
-# Input "74804-9625" with MRN over the trailing "25" surrogates to "74804-96MRN..", the
-# recorded fusion. Backstop must eat the ZIP material "74804-96" and leave the MRN letters.
+# Input "74804-9625" with MRN over the trailing "25". At Branch 5 this surrogated to
+# "74804-96MRN..", a fusion left for a later branch. Branch 2's sub-run insurance now DROPS the
+# ZIP+4-tail MRN (a mis-tag), so the ZIP backstop re-generalizes the whole ZIP cleanly with no
+# fused MRN. Assertion updated to the post-Branch-2 stacked behavior: clean state+ZIP+4, no leak.
 case("N13 truncated 'OK 74804-96'+MRN", "Addr: Kethley Rd / SHAWNEE OK 74804-9625", "25", MRN,
-     lambda o, l: ("74804-96" not in o and "74804" not in o and bool(re.search(r"MRN\d\d", o)),
-                   "ZIP material gone AND fused MRN token intact"))
+     lambda o, l: ("74804" not in o and "9625" not in o and bool(re.search(r"\bOK \d{5}-\d{4}\b", o))
+                   and "MRN" not in o.split("SHAWNEE")[-1],
+                   "ZIP re-generalized clean, no MRN fusion (Branch 2 dropped the ZIP+4-tail MRN)"))
 
 # ---- Leak shape D: prefix-fused ZIP body behind letters. Note 2: MRN over the LEADING digit. ----
 # Input "73084-9167" with MRN over the leading "7" surrogates to "MRN<d>3084-9167", the
