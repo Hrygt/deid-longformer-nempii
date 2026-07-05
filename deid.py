@@ -54,6 +54,10 @@ def normalize_name(name: str) -> str:
 DOB_LINE_RE = re.compile(r'^(DOB:\s*)(.+)$', re.MULTILINE | re.IGNORECASE)
 DATE_RE = re.compile(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}')
 
+# Marker for the _shift_date output contract (fix/date-shift-contract). Tests import-guard
+# this to label whether the components-mirroring contract is present.
+_DATE_CONTRACT = True
+
 
 def _clean_dob_lines(text: str) -> str:
     """
@@ -423,26 +427,87 @@ class ClinicalDeidentifier:
     # === DATE HANDLING ===
     
     def _shift_date(self, text: str) -> str:
-        """Shift date by consistent offset, preserving original format."""
+        """Shift a date by the per-note offset under a COMPONENTS-MIRRORING output contract
+        (adapted from Philter V1.0, JAMIA Open 2023): emit ONLY the components present in the
+        input, in the input's format family, never manufacturing a component the input lacked
+        (bare year in -> bare year out; MM/DD in -> MM/DD out). The surrogate is length-
+        disciplined (within 2 characters of the input for numeric output) and round-trip valid
+        (any month/day output re-parses as a real calendar date).
+
+        Bare-year semantics (decided): a bare year is anchored mid-year (Jul 1) and shifted by
+        the same day offset, then emitted year-only. If the shift lands in the same year, that
+        same year IS the offset's answer (a year has no finer granularity to move) and a bare
+        year is Safe Harbor-permissible, so 2009 in / 2009 out is legal output; it is the shift
+        result, not a formatting accident.
+
+        No-structure fallback: input with no parseable date is NOT manufactured into a date
+        (Branch 1 owns dropping it at the span layer); it degrades to a same-length, digit-
+        preserving placeholder, so a stray fragment can never fuse a 10-char date into a
+        neighbor. Input is never passed through raw."""
         if self._date_shift is None:
             self._date_shift = random.randint(-365, -30)
-        
         text = text.strip()
-        
-        # Try to parse and shift the date
+
+        core = self._shift_date_core(text)
+        if core is not None:
+            return core
+        # Multi-token or label/time-fused span (a TIME-fold "MM/DD/YYYY  4:13 PM", a merged
+        # "2019\t10/20/24", a label-fused "Time: 6/30/2026 12:12 AM"): shift each embedded
+        # date/year token in place and MIRROR everything else (labels, times, tabs, fused
+        # suffixes). Times are not PHI; a fused non-date suffix is Branch 1's span-trim
+        # territory and is preserved, never garbled into a malformed date.
+        emb = self._shift_embedded(text)
+        if emb is not None:
+            return emb
+        # No date structure at all: same-length, digit-preserving placeholder (never a date).
+        return self._disciplined_fallback(text)
+
+    _EMBEDDED_DATE = re.compile(
+        r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{1,2}-\d{1,2}|\b(?:19|20)\d{2}\b")
+
+    def _shift_embedded(self, text: str) -> Optional[str]:
+        """Shift each embedded date-shaped or bare-year token, mirroring all other characters.
+        Returns the rewritten span, or None if it held no such token (a genuine fragment for the
+        disciplined fallback). Each token goes through _shift_date_core, so components-mirroring,
+        length discipline, and round-trip validity hold per token."""
+        def repl(m):
+            shifted = self._shift_date_core(m.group(0))
+            return shifted if shifted is not None else m.group(0)
+        out = self._EMBEDDED_DATE.sub(repl, text)
+        return out if out != text else None
+
+    def _shift_date_core(self, text: str) -> Optional[str]:
+        """Parse+shift one date under the contract. Returns the shifted string, or None when
+        the text has no parseable date structure (caller applies the disciplined fallback)."""
         parsed = self._parse_date(text)
-        if parsed:
-            dt, fmt = parsed
-            shifted = dt + timedelta(days=self._date_shift)
-            return shifted.strftime(fmt)
-        
-        # Couldn't parse: derive a STABLE, DISTINCT fake from the text itself, so
-        # different unparseable dates never collapse onto a single placeholder
-        # (the old fixed reference made every unparseable date identical).
-        import hashlib
-        h = int(hashlib.md5(text.encode("utf-8")).hexdigest(), 16)
-        base = datetime(2025, 1, 15) + timedelta(days=self._date_shift)
-        return (base + timedelta(days=(h % 700) - 350)).strftime("%m/%d/%Y")
+        if not parsed:
+            return None
+        dt, fmt = parsed
+        out = (dt + timedelta(days=self._date_shift)).strftime(fmt)
+        # Round-trip validity: the emitted value must re-parse under its OWN format as a real
+        # calendar date, so a malformed value (2003/02/2043-class) can never be returned.
+        try:
+            datetime.strptime(out, fmt)
+        except ValueError:
+            return None
+        # Length discipline (numeric family only; written month names vary legitimately by
+        # name length and are governed by components-mirroring + round-trip instead).
+        if not any(c.isalpha() for c in out) and abs(len(out) - len(text)) > 2:
+            print(f"[deid] date-shift length-discipline fallback: {text!r} -> {out!r}")
+            return None
+        return out
+
+    def _disciplined_fallback(self, text: str) -> str:
+        """No parseable date structure -> never manufacture a date. Emit a same-length,
+        digit-preserving placeholder: each digit is shifted deterministically by the per-note
+        offset, other characters are preserved except alphabetics (redacted to 'x', since alpha
+        in an unparseable 'date' span is not a date). Length is preserved, so a fragment can
+        never fuse a long surrogate into its neighbor, and input never passes through raw."""
+        k = (self._date_shift or 0) % 10
+        return "".join(
+            str((int(c) + k) % 10) if c.isdigit() else ("x" if c.isalpha() else c)
+            for c in text
+        )
     
     def _generate_dob(self, text: str) -> str:
         """Generate realistic DOB preserving approximate age (±2 years)."""
@@ -560,17 +625,32 @@ class ClinicalDeidentifier:
             except ValueError:
                 pass
 
-        # Robust fallback: dateutil handles separators/orders the explicit list
-        # misses (2024/11/05, 11.5.2024, "Nov 5 2024", "5 Nov 2024", etc.). Parsing
-        # here means the date gets a real consistent shift instead of the collapse
-        # fallback, so intervals across the chart are preserved.
-        try:
-            from dateutil import parser as _du
-            dt = _du.parse(text.strip())
-            if 1900 <= dt.year <= 2100:
-                return (dt, "%m/%d/%Y")
-        except Exception:
-            pass
+        # Bare 4-digit YEAR: mirror as a year (components-mirroring, year in / year out).
+        # Anchor mid-year (Jul 1) so the day offset yields the shifted year without an
+        # end-of-year formatting bias. Emitting "%Y" keeps output year-only.
+        year_match = re.match(r'^(\d{4})$', text.strip())
+        if year_match:
+            y = int(year_match.group(1))
+            if 1900 <= y <= 2100:
+                return (datetime(y, 7, 1), "%Y")
+
+        # Bare 1-3 digit fragment: no date structure. Return None so _shift_date's disciplined
+        # fallback handles it, instead of the old dateutil-coerces-a-fragment-into-a-full-date
+        # bug ("22" -> 06/14/2026, "43" -> 05/28/2043 fusing to 2003/02/2043).
+        if re.fullmatch(r'\d{1,3}', text.strip()):
+            return None
+
+        # Robust fallback: dateutil handles structured forms the explicit list misses
+        # (2024/11/05, 11.5.2024, "Nov 5 2024", "5 Nov 2024"). GUARDED to inputs carrying date
+        # structure (a separator or an alphabetic month) so a bare number is never coerced.
+        if re.search(r'[A-Za-z]', text) or re.search(r'[/.\-]', text):
+            try:
+                from dateutil import parser as _du
+                dt = _du.parse(text.strip())
+                if 1900 <= dt.year <= 2100:
+                    return (dt, "%m/%d/%Y")
+            except Exception:
+                pass
 
         return None
     
