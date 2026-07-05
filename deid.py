@@ -879,6 +879,97 @@ def _build_surrogate_map(subs: list) -> dict:
     return {"version": 1, "pairs": list(pairs.values())}
 
 
+# US state / DC abbreviations. A bare 5-digit ZIP is swept ONLY when one of these appears
+# immediately before it; an unconditioned \d{5} would destroy account numbers, lab accession
+# IDs, and vitals rows. The pilot's real address blocks are all Oklahoma ("SHAWNEE OK 74804"),
+# so OK must stay in the set even though OK/IN/OR double as English words (shapes B/C/D also
+# require a ZIP-shaped token, which bounds that collision).
+_US_STATE_ABBR = (
+    "AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT "
+    "NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC"
+).split()
+_STATE_ALT = "|".join(_US_STATE_ABBR)
+
+# leak shape A: full ZIP+4 surviving verbatim (pilot notes 1/8/12/19: "OK 74804-9638").
+# Left guard forbids a letter/digit/hyphen before (so a run start is clean); right guard
+# forbids a longer digit run. Fires UNCONDITIONALLY: a 5-4 hyphenation is ZIP-distinctive
+# (phones are 3-3-4, SSNs 3-2-4, dates use slashes), so it cannot match those shapes.
+_RE_ZIP4 = re.compile(r"(?<![A-Za-z\d-])\d{5}-\d{4}(?![-\d])")
+
+# leak shape C: truncated/fused ZIP (pilot note 13 / site 8: "74804-96MRN68", or "74804-96"
+# at line end). 5 digits, hyphen, 1-3 digits that do NOT complete a 4-digit +4 (that is shape
+# A). Consumes ZIP material ONLY; any fused surrogate letters ("MRN68") sit OUTSIDE the match
+# and are left for the fusion branches. Composes with Branch 4 (digit-suffix leftward span
+# expansion, not yet cut): whichever runs, the ZIP material dies. Do NOT weaken either pass on
+# the assumption the other will catch it.
+_RE_ZIP_TRUNC = re.compile(r"(?<![A-Za-z\d-])\d{5}-\d{1,3}(?![-\d])")
+
+# leak shape D: prefix-fused ZIP body behind a letter run (pilot note 2: "MRN63084-9167",
+# where the ZIP's LEADING digit was mis-tagged and surrogated to "MRN.."). The ZIP-shaped tail
+# \d{4,5}-\d{4} sits directly after letters; a state/address-supported line gates it (below) so
+# it does not catch letter-prefixed identifiers.
+_RE_ZIP_PREFIX = re.compile(r"(?<=[A-Za-z])\d{4,5}-\d{4}(?![-\d])")
+
+# leak shape B: state-adjacent bare 5-digit ZIP (pilot notes 10/17: "OK 73115"). The state
+# token is the gate; group(1) keeps "STATE ", group(2) is the bare ZIP passed to _generalize_zip.
+# (?![-\d]) forbids a ZIP+4 (shape A) or a longer digit run (a 6+-digit id).
+_RE_STATE_ZIP5 = re.compile(r"(\b(?:" + _STATE_ALT + r")\b\s+)(\d{5})(?![-\d])")
+
+# a line "supports" the letter-adjacent shapes C and D only if it carries a state token
+# (address-shaped); without this gate, \d{5}-\d{1,3} could match numeric ranges elsewhere.
+_RE_STATE_TOKEN = re.compile(r"\b(?:" + _STATE_ALT + r")\b")
+
+
+def _zip_residual_backstop(text: str, deid: "ClinicalDeidentifier", surrogate_map: dict = None) -> str:
+    """Post-substitution TEXT sweep: re-generalize ZIP patterns that survived detection.
+
+    A pilot-measured PHI leak class: undetected or partially-covered ZIPs passed verbatim into
+    de-identified output (9 of 12 input ZIPs leaked full or partial ZIP material; the ZIP+4
+    form went 0 for 7). Mirrors the patient-token backstop above: a text-level re.sub net below
+    the substitution loop. All surrogate policy is delegated to deid._generalize_zip (which
+    expects a BARE ZIP string), so the state prefix is split off here and reattached;
+    _generalize_zip itself is not modified.
+
+    surrogate_map (optional, return_map path only): the already-built re-id map. When present, a
+    ZIP that is ALREADY a recorded POSTCODE surrogate is left untouched, so its map value stays
+    locatable in the output for the CPT grader's re-identification overlay (README: return_map ->
+    "restore the real entities in its output"). Raw undetected input ZIPs are never in the map, so
+    their leak neutralization is never skipped; only the harmless re-generalization of an already
+    clean, already-mapped surrogate is suppressed. None -> no protection, so the non-map call path
+    is unchanged (a bare fake ZIP is still harmlessly re-generalized).
+
+    Idempotence: on already-clean output with no map, the pass is a harmless RE-GENERALIZATION,
+    not a strict no-op. A prior fake ZIP is itself ZIP-shaped and state-adjacent, so it is replaced
+    by another valid fake ZIP of the same format (still de-identified). Never a corruption."""
+    protected = set()
+    if surrogate_map:
+        for p in surrogate_map.get("pairs", []):
+            if p.get("type") == "POSTCODE" and p.get("surrogate"):
+                protected.add(p["surrogate"])
+
+    def gen(zipstr):
+        # Surrogate-map consistency guard: a ZIP that is already a recorded POSTCODE surrogate is
+        # clean and the re-id map points at it; re-generalizing would strand that map value. Skip.
+        # Raw leaked ZIPs are absent from the map, so they are still neutralized below.
+        if zipstr in protected:
+            return zipstr
+        return deid._generalize_zip(zipstr)
+
+    out = []
+    for line in text.split("\n"):
+        # A: full ZIP+4 (unconditional) -- replace the digit run, keep surrounding text.
+        line = _RE_ZIP4.sub(lambda m: gen(m.group(0)), line)
+        # B: state-adjacent bare 5-digit -- keep the "STATE " prefix, re-generalize the ZIP.
+        line = _RE_STATE_ZIP5.sub(lambda m: m.group(1) + gen(m.group(2)), line)
+        if _RE_STATE_TOKEN.search(line):
+            # C: truncated/fused ZIP -- consume ZIP material only, leave fused letters.
+            line = _RE_ZIP_TRUNC.sub(lambda m: gen(m.group(0)), line)
+            # D: prefix-fused ZIP body behind letters -- eat the ZIP tail, leave the letters.
+            line = _RE_ZIP_PREFIX.sub(lambda m: gen(m.group(0)), line)
+        out.append(line)
+    return "\n".join(out)
+
+
 def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict = None,
                     return_map: bool = False):
     """
@@ -961,9 +1052,25 @@ def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict 
     # by bare digits).
     result = re.sub(r"(\b\d{1,2}/\d{1,2}/\d{4})\d+", r"\1", result)
 
+    # Build the re-id map from the ACTUAL substitutions BEFORE the ZIP backstop (return_map path
+    # only), so the backstop can protect already-recorded POSTCODE surrogates from harmless
+    # re-generalization and keep every map value locatable in the output for the CPT grader's
+    # re-identification overlay (README: return_map). The map reads from _subs, not the text, so
+    # building it here vs at return is value-identical; None on the non-map path leaves that path
+    # unchanged (raw leaked ZIPs, absent from the map, are still neutralized either way).
+    surrogate_map = _build_surrogate_map(_subs) if return_map else None
+
+    # ZIP residual backstop: re-generalize any ZIP pattern that survived detection (undetected
+    # or partially-covered ZIPs leaked verbatim in the pilot). Text-level, below detection; all
+    # surrogate policy stays in _generalize_zip. Sits after the trailing-date sanitizer and
+    # before _clean_dob_lines -- the two are independent (DOB cleanup only rewrites ^DOB: lines
+    # and ZIP surrogates carry no date shape), so this grouping keeps the residual text sweeps
+    # together after substitution.
+    result = _zip_residual_backstop(result, deid, surrogate_map=surrogate_map)
+
     # Post-process DOB line(s) to keep a single clean date
     result = _clean_dob_lines(result)
 
     if return_map:
-        return result, _build_surrogate_map(_subs)
+        return result, surrogate_map
     return result
