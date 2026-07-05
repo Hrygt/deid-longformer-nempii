@@ -43,12 +43,19 @@ def _read_deployed_version() -> str:
 DEPLOYED_VERSION = _read_deployed_version()
 
 # === Load Model (once at startup) ===
-print(f"Loading model from {MODEL_PATH} on {DEVICE}...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-model = AutoModelForTokenClassification.from_pretrained(MODEL_PATH)
-model.to(DEVICE)
-model.eval()
-print(f"Model loaded: {model.num_parameters():,} parameters")
+# DEID_SKIP_MODEL_LOAD lets model-free unit tests import this module (and its pure
+# regex passes like filter_safe_spans) without a GPU/checkpoint. Off in production.
+if os.environ.get("DEID_SKIP_MODEL_LOAD"):
+    print("DEID_SKIP_MODEL_LOAD set: skipping model load (test/import mode)")
+    tokenizer = None
+    model = None
+else:
+    print(f"Loading model from {MODEL_PATH} on {DEVICE}...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+    model = AutoModelForTokenClassification.from_pretrained(MODEL_PATH)
+    model.to(DEVICE)
+    model.eval()
+    print(f"Model loaded: {model.num_parameters():,} parameters")
 
 # === FastAPI App ===
 app = FastAPI(
@@ -528,6 +535,92 @@ def filter_whitelisted_entities(entities: list[dict]) -> list[dict]:
     return filtered
 
 
+# === SAFE-span veto (Branch 6) ===
+# Two SAFE patterns adapted from planning/recognizers/structured_recognizers_seed.py
+# (Philter safe-filter idiom, BSD-3, UCSF Regents; Norgeot et al. 2020). A SAFE match
+# claims text no detector may surrogate; a detected entity FULLY CONTAINED in a firing
+# SAFE match is vetoed before name resolution and substitution.
+
+# clock HHMM, value-bounded to valid clock values. Edge lookarounds reject adjacency to
+# digits, slashes, colons, hyphens, PERIODS and COMMAS. The last two harden against the
+# European date year (01.06.2028) and are the separator half of the fail-safe; the context
+# gate below is the other half. Kills sites 4/5 + note 3 (DATE over an HHMM clock tail).
+# Provenance: seed clock_hhmm.
+_SAFE_CLOCK = re.compile(r"(?<![\d/:.,-])(?:[01]\d|2[0-3])[0-5]\d(?![\d/:.,-])")
+# room token, fires unconditionally (the containment rule bounds it). Kills notes 11/12
+# (POSTCODE over RM06/RM08). Provenance: seed room_token.
+_SAFE_ROOM = re.compile(r"\bRM\d{2}\b")
+# time cue that licenses a clock match OUTSIDE a tabular/cell line. Derived from the 158
+# pilot matches: "at" is the only clean cue (18 "at HHMM"); IN/TO/OF/AROUND rejected (they
+# precede years, e.g. "in 2019"); DING/STE/ALT were substring artifacts of ending/Suite.
+_TIME_CUE = re.compile(r"(?i)\bat\s*$")
+
+
+def _line_at(text: str, pos: int):
+    """(line_text, column_within_line) for absolute offset pos."""
+    ls = text.rfind("\n", 0, pos) + 1
+    le = text.find("\n", pos)
+    if le == -1:
+        le = len(text)
+    return text[ls:le], pos - ls
+
+
+def _clock_context_ok(line: str, col: int) -> bool:
+    """Context gate: a clock match fires only in tabular context (a tab), an Epic
+    tabular-row cell (a line with no ASCII letters, a bare value column), or immediately
+    after a time cue. Prose date lines have letters, no tab and no cue, so they never fire,
+    which is what protects the 114 gold DATE/DOB year overlaps from the year-sweep."""
+    if "\t" in line:
+        return True
+    if not any(c.isalpha() for c in line):
+        return True
+    return bool(_TIME_CUE.search(line[max(0, col - 8):col]))
+
+
+def filter_safe_spans(text: str, entities: list[dict]) -> list[dict]:
+    """Veto entities that fall inside a SAFE span (clock time / room token). Detection-side
+    sibling of filter_whitelisted_entities: runs immediately after it and before
+    patient_sweep, so vetoed spans never reach name resolution or substitution.
+
+    CONTAINMENT rule: clock_hhmm vetoes only by STRICT (proper) containment -- the entity must
+    be strictly smaller than and inside the match, so an equal-span 4-digit token is never
+    vetoed and flows to substitution unchanged. room_token keeps FULL containment (equal
+    allowed; RM tokens have no PHI collision class). Overlap without containment never vetoes.
+    Each veto is logged like the other drop paths (print), so deid_log provenance stays complete."""
+    if not entities:
+        return entities
+    safe = []  # (start, end, pattern_name)
+    for m in _SAFE_ROOM.finditer(text):
+        safe.append((m.start(), m.end(), "room_token"))
+    for m in _SAFE_CLOCK.finditer(text):
+        line, col = _line_at(text, m.start())
+        if _clock_context_ok(line, col):
+            safe.append((m.start(), m.end(), "clock_hhmm"))
+    if not safe:
+        return entities
+    kept = []
+    for e in entities:
+        s, en = e.get("start"), e.get("end")
+        vetoed_by = None
+        if s is not None and en is not None:
+            for ss, se, name in safe:
+                if ss <= s and en <= se:  # entity contained in a SAFE match
+                    # Decision 1: clock veto is STRICT -- an equal-span 4-digit token is left to
+                    # the NER's judgment because a bare year and a clock time are indistinguishable
+                    # at the pattern level, and an un-shifted year would let a reader triangulate
+                    # the per-note date-shift offset. room_token keeps full (equal) containment.
+                    if name == "clock_hhmm" and (s, en) == (ss, se):
+                        continue  # equal-span clock: never vetoed (flows to substitution)
+                    vetoed_by = name
+                    break
+        if vetoed_by is not None:
+            print(f"[deid] SAFE-veto {vetoed_by} dropped {e.get('type')} span "
+                  f"{s}:{en} {text[s:en]!r}")
+            continue
+        kept.append(e)
+    return kept
+
+
 # deidentify_text is now imported from deid.py (includes DOB cleanup)
 
 RESOLVE_ENABLED = os.environ.get("DEID_RESOLVE", "on").lower() not in ("off", "0", "false", "no")
@@ -785,6 +878,10 @@ async def process_text(request: DeidRequest):
     # Filter out whitelisted medical terms (prevents false positives)
     entities = filter_whitelisted_entities(entities)
 
+    # SAFE-span veto: drop NER FPs contained in a clock-time / room-token SAFE match
+    # (clock-tail DATE FPs, RM0x POSTCODE FPs) before name resolution or substitution.
+    entities = filter_safe_spans(request.text, entities)
+
     # Sweep NER-missed occurrences of the patient's own name tokens (recall safety net)
     entities = entities + patient_sweep(request.text, entities)
 
@@ -829,6 +926,8 @@ async def process_batch(request: BatchRequest):
         entities = entities + find_missed_names(note, entities)
         # Filter out whitelisted medical terms
         entities = filter_whitelisted_entities(entities)
+        # SAFE-span veto (same as /deid/process): drop clock-tail / room-token FPs
+        entities = filter_safe_spans(note, entities)
         entities = entities + patient_sweep(note, entities)
         name_map = resolve_names(note, entities)
         # Use seed + index for reproducibility across batch
