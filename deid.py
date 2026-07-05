@@ -925,6 +925,74 @@ def _trim_identifier_span_edges(entities: list, raw_text: str) -> list:
     return out
 
 
+# Maximal complete date token, value-bounded per the Philter idiom (planning/recognizers/
+# structured_recognizers_seed.py DATE_MAXIMAL_TOKEN, extended to cover every shape the Branch 3
+# _parse_date accepts: the numeric slash/dash forms, ISO, YYYYMMDD, written month-name forms,
+# MM/DD short, bare year, and an optional folded time). Never lazy digit counts. Ordered so the
+# longest/most-specific form wins at a position (full date before MM/DD short before bare year).
+_DT_MON = (r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|"
+           r"Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)")
+_DT_MM = r"(?:1[0-2]|0?[1-9])"          # 10-12 before 1-9 (ordered alternation is first-match)
+_DT_DD = r"(?:3[01]|[12]\d|0?[1-9])"    # 30-31, 10-29, then 1-9, so "15" is not cut to "1"
+_DT_YYYY = r"(?:19|20)\d{2}"
+_DT_TIME = r"(?:[ \t]+\d{1,2}:\d{2}(?::\d{2})?(?:\s*[APap]\.?[Mm]\.?)?)?"
+_DATE_TOKEN = re.compile(
+    r"(?:"
+    + _DT_YYYY + r"-" + _DT_MM + r"-" + _DT_DD                                   # ISO YYYY-MM-DD
+    + r"|" + _DT_MM + r"[/-]" + _DT_DD + r"[/-]\d{2,4}"                          # MM/DD/YYYY or /YY
+    + r"|" + _DT_MON + r"\.?\s+" + _DT_DD + r"(?:st|nd|rd|th)?,?\s+" + _DT_YYYY  # Month D, YYYY
+    + r"|" + _DT_DD + r"(?:st|nd|rd|th)?\s+" + _DT_MON + r"\.?\s+" + _DT_YYYY    # D Month YYYY
+    + r"|" + _DT_MM + r"[/-]" + _DT_DD                                          # MM/DD short
+    + r"|" + _DT_YYYY + _DT_MM + _DT_DD                                         # YYYYMMDD
+    + r"|" + _DT_YYYY                                                           # bare year
+    + r")" + _DT_TIME
+)
+
+_DATE_FAMILY = ("DATE", "DATE_OF_BIRTH", "DATE_TIME")
+
+
+def _date_span_boundary(entities: list, text: str) -> list:
+    """DATE-family span boundary guard (span layer). Two rules:
+
+    (1) No-digit DROP: a DATE-family span with no digit ("Time", "QDAY", "TBD", "Saturday") is
+        not a date; drop it so the word survives verbatim instead of being mangled to "xxxx" by
+        the substitution-layer disciplined fallback. (Digit-bearing garbage still flows to that
+        fallback; this rule owns only the no-digit case.)
+    (2) Maximal-token TRIM: a span containing exactly one complete date token (with any leading
+        non-token garbage or trailing non-date text, e.g. a header "11/13/2025\\nCre") is trimmed
+        to that token. A multi-cell span (two or more date tokens, e.g. "2019\\t10/20/24") passes
+        through untrimmed so Branch 3's embedded shift handles each token; a legitimate written /
+        ISO / bare-year / MM-DD / folded date+time span is one token spanning the whole span and
+        is never split (the recall regression named in the foundation report).
+
+    Runs after _merge_adjacent_date_entities (tightens merged spans, not fragments) and before
+    _split_name_spans / _trim_identifier_span_edges. The later DOB lookback retype (substitution
+    loop) is unaffected: it keys on text before the span start, and a DOB date is a clean single
+    token with no leading garbage, so its start does not move."""
+    out = []
+    for ent in entities:
+        if ent.get("type") not in _DATE_FAMILY:
+            out.append(ent)
+            continue
+        s, e = ent["start"], ent["end"]
+        span = text[s:e]
+        if not any(c.isdigit() for c in span):
+            print(f"[deid] date-span drop (no digit) {ent.get('type')} {s}:{e} {span!r}")
+            continue
+        toks = list(_DATE_TOKEN.finditer(span))
+        if len(toks) == 1:
+            ts, te = toks[0].start(), toks[0].end()
+            if (ts, te) != (0, len(span)):
+                ne = dict(ent)
+                ne["start"], ne["end"], ne["text"] = s + ts, s + te, text[s + ts:s + te]
+                print(f"[deid] date-span trim {ent.get('type')} {s}:{e}->{ne['start']}:{ne['end']} "
+                      f"{span!r}->{ne['text']!r}")
+                out.append(ne)
+                continue
+        out.append(ent)  # clean single token, multi-cell, or no recognized token: pass through
+    return out
+
+
 def _build_surrogate_map(subs: list) -> dict:
     """Assemble the original<->surrogate pairs that were ACTUALLY substituted, for
     output-side re-identification. This is additive observation only — it reads values
@@ -1073,7 +1141,13 @@ def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict 
     # Pre-process: Merge fragmented DATE entities back together
     # Model sometimes splits "03/15/1965" into "03", "/", "15", etc.
     entities = _merge_adjacent_date_entities(entities, text)
-    
+
+    # DATE span boundary guard: trim a DATE-family span to its maximal date token (header
+    # over-reach like "11/13/2025\nCre") and drop a no-digit DATE span ("Time"/"QDAY") so the
+    # word survives verbatim. After the merge (so it tightens merged spans), before the name/
+    # identifier edge passes.
+    entities = _date_span_boundary(entities, text)
+
     # Pre-process: Combine adjacent FIRST_NAME/LAST_NAME into single NAME entities
     # This ensures "Sarah" + "Johnson" gets same cache key as "Sarah Elizabeth Johnson"
     entities = _combine_adjacent_name_entities(entities, text)
