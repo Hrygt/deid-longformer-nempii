@@ -54,6 +54,10 @@ def normalize_name(name: str) -> str:
 DOB_LINE_RE = re.compile(r'^(DOB:\s*)(.+)$', re.MULTILINE | re.IGNORECASE)
 DATE_RE = re.compile(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}')
 
+# Marker for the _shift_date output contract (fix/date-shift-contract). Tests import-guard
+# this to label whether the components-mirroring contract is present.
+_DATE_CONTRACT = True
+
 
 def _clean_dob_lines(text: str) -> str:
     """
@@ -423,26 +427,87 @@ class ClinicalDeidentifier:
     # === DATE HANDLING ===
     
     def _shift_date(self, text: str) -> str:
-        """Shift date by consistent offset, preserving original format."""
+        """Shift a date by the per-note offset under a COMPONENTS-MIRRORING output contract
+        (adapted from Philter V1.0, JAMIA Open 2023): emit ONLY the components present in the
+        input, in the input's format family, never manufacturing a component the input lacked
+        (bare year in -> bare year out; MM/DD in -> MM/DD out). The surrogate is length-
+        disciplined (within 2 characters of the input for numeric output) and round-trip valid
+        (any month/day output re-parses as a real calendar date).
+
+        Bare-year semantics (decided): a bare year is anchored mid-year (Jul 1) and shifted by
+        the same day offset, then emitted year-only. If the shift lands in the same year, that
+        same year IS the offset's answer (a year has no finer granularity to move) and a bare
+        year is Safe Harbor-permissible, so 2009 in / 2009 out is legal output; it is the shift
+        result, not a formatting accident.
+
+        No-structure fallback: input with no parseable date is NOT manufactured into a date
+        (Branch 1 owns dropping it at the span layer); it degrades to a same-length, digit-
+        preserving placeholder, so a stray fragment can never fuse a 10-char date into a
+        neighbor. Input is never passed through raw."""
         if self._date_shift is None:
             self._date_shift = random.randint(-365, -30)
-        
         text = text.strip()
-        
-        # Try to parse and shift the date
+
+        core = self._shift_date_core(text)
+        if core is not None:
+            return core
+        # Multi-token or label/time-fused span (a TIME-fold "MM/DD/YYYY  4:13 PM", a merged
+        # "2019\t10/20/24", a label-fused "Time: 6/30/2026 12:12 AM"): shift each embedded
+        # date/year token in place and MIRROR everything else (labels, times, tabs, fused
+        # suffixes). Times are not PHI; a fused non-date suffix is Branch 1's span-trim
+        # territory and is preserved, never garbled into a malformed date.
+        emb = self._shift_embedded(text)
+        if emb is not None:
+            return emb
+        # No date structure at all: same-length, digit-preserving placeholder (never a date).
+        return self._disciplined_fallback(text)
+
+    _EMBEDDED_DATE = re.compile(
+        r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{1,2}-\d{1,2}|\b(?:19|20)\d{2}\b")
+
+    def _shift_embedded(self, text: str) -> Optional[str]:
+        """Shift each embedded date-shaped or bare-year token, mirroring all other characters.
+        Returns the rewritten span, or None if it held no such token (a genuine fragment for the
+        disciplined fallback). Each token goes through _shift_date_core, so components-mirroring,
+        length discipline, and round-trip validity hold per token."""
+        def repl(m):
+            shifted = self._shift_date_core(m.group(0))
+            return shifted if shifted is not None else m.group(0)
+        out = self._EMBEDDED_DATE.sub(repl, text)
+        return out if out != text else None
+
+    def _shift_date_core(self, text: str) -> Optional[str]:
+        """Parse+shift one date under the contract. Returns the shifted string, or None when
+        the text has no parseable date structure (caller applies the disciplined fallback)."""
         parsed = self._parse_date(text)
-        if parsed:
-            dt, fmt = parsed
-            shifted = dt + timedelta(days=self._date_shift)
-            return shifted.strftime(fmt)
-        
-        # Couldn't parse: derive a STABLE, DISTINCT fake from the text itself, so
-        # different unparseable dates never collapse onto a single placeholder
-        # (the old fixed reference made every unparseable date identical).
-        import hashlib
-        h = int(hashlib.md5(text.encode("utf-8")).hexdigest(), 16)
-        base = datetime(2025, 1, 15) + timedelta(days=self._date_shift)
-        return (base + timedelta(days=(h % 700) - 350)).strftime("%m/%d/%Y")
+        if not parsed:
+            return None
+        dt, fmt = parsed
+        out = (dt + timedelta(days=self._date_shift)).strftime(fmt)
+        # Round-trip validity: the emitted value must re-parse under its OWN format as a real
+        # calendar date, so a malformed value (2003/02/2043-class) can never be returned.
+        try:
+            datetime.strptime(out, fmt)
+        except ValueError:
+            return None
+        # Length discipline (numeric family only; written month names vary legitimately by
+        # name length and are governed by components-mirroring + round-trip instead).
+        if not any(c.isalpha() for c in out) and abs(len(out) - len(text)) > 2:
+            print(f"[deid] date-shift length-discipline fallback: {text!r} -> {out!r}")
+            return None
+        return out
+
+    def _disciplined_fallback(self, text: str) -> str:
+        """No parseable date structure -> never manufacture a date. Emit a same-length,
+        digit-preserving placeholder: each digit is shifted deterministically by the per-note
+        offset, other characters are preserved except alphabetics (redacted to 'x', since alpha
+        in an unparseable 'date' span is not a date). Length is preserved, so a fragment can
+        never fuse a long surrogate into its neighbor, and input never passes through raw."""
+        k = (self._date_shift or 0) % 10
+        return "".join(
+            str((int(c) + k) % 10) if c.isdigit() else ("x" if c.isalpha() else c)
+            for c in text
+        )
     
     def _generate_dob(self, text: str) -> str:
         """Generate realistic DOB preserving approximate age (±2 years)."""
@@ -560,17 +625,32 @@ class ClinicalDeidentifier:
             except ValueError:
                 pass
 
-        # Robust fallback: dateutil handles separators/orders the explicit list
-        # misses (2024/11/05, 11.5.2024, "Nov 5 2024", "5 Nov 2024", etc.). Parsing
-        # here means the date gets a real consistent shift instead of the collapse
-        # fallback, so intervals across the chart are preserved.
-        try:
-            from dateutil import parser as _du
-            dt = _du.parse(text.strip())
-            if 1900 <= dt.year <= 2100:
-                return (dt, "%m/%d/%Y")
-        except Exception:
-            pass
+        # Bare 4-digit YEAR: mirror as a year (components-mirroring, year in / year out).
+        # Anchor mid-year (Jul 1) so the day offset yields the shifted year without an
+        # end-of-year formatting bias. Emitting "%Y" keeps output year-only.
+        year_match = re.match(r'^(\d{4})$', text.strip())
+        if year_match:
+            y = int(year_match.group(1))
+            if 1900 <= y <= 2100:
+                return (datetime(y, 7, 1), "%Y")
+
+        # Bare 1-3 digit fragment: no date structure. Return None so _shift_date's disciplined
+        # fallback handles it, instead of the old dateutil-coerces-a-fragment-into-a-full-date
+        # bug ("22" -> 06/14/2026, "43" -> 05/28/2043 fusing to 2003/02/2043).
+        if re.fullmatch(r'\d{1,3}', text.strip()):
+            return None
+
+        # Robust fallback: dateutil handles structured forms the explicit list misses
+        # (2024/11/05, 11.5.2024, "Nov 5 2024", "5 Nov 2024"). GUARDED to inputs carrying date
+        # structure (a separator or an alphabetic month) so a bare number is never coerced.
+        if re.search(r'[A-Za-z]', text) or re.search(r'[/.\-]', text):
+            try:
+                from dateutil import parser as _du
+                dt = _du.parse(text.strip())
+                if 1900 <= dt.year <= 2100:
+                    return (dt, "%m/%d/%Y")
+            except Exception:
+                pass
 
         return None
     
@@ -845,6 +925,183 @@ def _trim_identifier_span_edges(entities: list, raw_text: str) -> list:
     return out
 
 
+# Maximal complete date token, value-bounded per the Philter idiom (planning/recognizers/
+# structured_recognizers_seed.py DATE_MAXIMAL_TOKEN, extended to cover every shape the Branch 3
+# _parse_date accepts: the numeric slash/dash forms, ISO, YYYYMMDD, written month-name forms,
+# MM/DD short, bare year, and an optional folded time). Never lazy digit counts. Ordered so the
+# longest/most-specific form wins at a position (full date before MM/DD short before bare year).
+_DT_MON = (r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|"
+           r"Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)")
+_DT_MM = r"(?:1[0-2]|0?[1-9])"          # 10-12 before 1-9 (ordered alternation is first-match)
+_DT_DD = r"(?:3[01]|[12]\d|0?[1-9])"    # 30-31, 10-29, then 1-9, so "15" is not cut to "1"
+_DT_YYYY = r"(?:19|20)\d{2}"
+_DT_TIME = r"(?:[ \t]+\d{1,2}:\d{2}(?::\d{2})?(?:\s*[APap]\.?[Mm]\.?)?)?"
+_DATE_TOKEN = re.compile(
+    r"(?:"
+    + _DT_YYYY + r"-" + _DT_MM + r"-" + _DT_DD                                   # ISO YYYY-MM-DD
+    + r"|" + _DT_MM + r"[/-]" + _DT_DD + r"[/-]\d{2,4}"                          # MM/DD/YYYY or /YY
+    + r"|" + _DT_MON + r"\.?\s+" + _DT_DD + r"(?:st|nd|rd|th)?,?\s+" + _DT_YYYY  # Month D, YYYY
+    + r"|" + _DT_DD + r"(?:st|nd|rd|th)?\s+" + _DT_MON + r"\.?\s+" + _DT_YYYY    # D Month YYYY
+    + r"|" + _DT_MM + r"[/-]" + _DT_DD                                          # MM/DD short
+    + r"|" + _DT_YYYY + _DT_MM + _DT_DD                                         # YYYYMMDD
+    + r"|" + _DT_YYYY                                                           # bare year
+    + r")" + _DT_TIME
+)
+
+_DATE_FAMILY = ("DATE", "DATE_OF_BIRTH", "DATE_TIME")
+
+
+def _date_span_boundary(entities: list, text: str) -> list:
+    """DATE-family span boundary guard (span layer). Two rules:
+
+    (1) No-digit DROP: a DATE-family span with no digit ("Time", "QDAY", "TBD", "Saturday") is
+        not a date; drop it so the word survives verbatim instead of being mangled to "xxxx" by
+        the substitution-layer disciplined fallback. (Digit-bearing garbage still flows to that
+        fallback; this rule owns only the no-digit case.)
+    (2) Maximal-token TRIM: a span containing exactly one complete date token (with any leading
+        non-token garbage or trailing non-date text, e.g. a header "11/13/2025\\nCre") is trimmed
+        to that token. A multi-cell span (two or more date tokens, e.g. "2019\\t10/20/24") passes
+        through untrimmed so Branch 3's embedded shift handles each token; a legitimate written /
+        ISO / bare-year / MM-DD / folded date+time span is one token spanning the whole span and
+        is never split (the recall regression named in the foundation report).
+
+    Runs after _merge_adjacent_date_entities (tightens merged spans, not fragments) and before
+    _split_name_spans / _trim_identifier_span_edges. The later DOB lookback retype (substitution
+    loop) is unaffected: it keys on text before the span start, and a DOB date is a clean single
+    token with no leading garbage, so its start does not move."""
+    out = []
+    for ent in entities:
+        if ent.get("type") not in _DATE_FAMILY:
+            out.append(ent)
+            continue
+        s, e = ent["start"], ent["end"]
+        span = text[s:e]
+        if not any(c.isdigit() for c in span):
+            print(f"[deid] date-span drop (no digit) {ent.get('type')} {s}:{e} {span!r}")
+            continue
+        toks = list(_DATE_TOKEN.finditer(span))
+        if len(toks) == 1:
+            ts, te = toks[0].start(), toks[0].end()
+            if (ts, te) != (0, len(span)):
+                ne = dict(ent)
+                ne["start"], ne["end"], ne["text"] = s + ts, s + te, text[s + ts:s + te]
+                print(f"[deid] date-span trim {ent.get('type')} {s}:{e}->{ne['start']}:{ne['end']} "
+                      f"{span!r}->{ne['text']!r}")
+                out.append(ne)
+                continue
+        out.append(ent)  # clean single token, multi-cell, or no recognized token: pass through
+    return out
+
+
+# Identifier families whose surrogate is alphanumeric (a leading alpha prefix plus a digit run);
+# an alpha run continuing past the span edge is a word, not part of the identifier.
+_REPAIR_ID = frozenset({
+    "MEDICAL_RECORD_NUMBER", "SSN", "HEALTH_PLAN_BENEFICIARY_NUMBER", "ACCOUNT_NUMBER",
+    "CUSTOMER_ID", "EMPLOYEE_ID", "UNIQUE_ID", "BIOMETRIC_IDENTIFIER",
+    "CERTIFICATE_LICENSE_NUMBER",
+})
+# Geographic families in scope for under-match completion (from the recorded evidence: the
+# STREET_ADDRESS span "3214 KETH" truncated "KETHLEY" mid-word).
+_REPAIR_GEO = frozenset({"STREET_ADDRESS"})
+# Sub-run insurance is scoped to the IDENTIFIER families. The date families' sub-run fragments
+# (clock tails) are already owned by the Branch 6 SAFE veto (clock/tabular context) and, if
+# un-vetoed, the Branch 3 disciplined fallback; expanding a clock-time tail into the full clock
+# run and re-surrogating it would conflict with that fragment contract. The recorded R3 evidence
+# (note 13 "25" of "9625", note 2 "7" of "73084") is entirely MRN.
+_REPAIR_SUBRUN = _REPAIR_ID
+_ZIP4_TAIL_RE = re.compile(r"\d{5}-$")
+
+
+def _repair_identifier_spans(entities: list, text: str) -> list:
+    """Identifier/geo span repair (span layer), three rules keyed on digit-run/word-boundary
+    arithmetic. Runs after _split_name_spans, before _trim_identifier_span_edges, so rule 3's
+    expansion to the full digit run happens first; the expanded span is all-digit with
+    alphanumeric edges, so the edge trim is a no-op on it (they compose without conflict).
+
+    R1 over-match split (identifier families): if a letter continues immediately past the span
+       end, retreat the end past the trailing alpha to the last digit run, preserving a leading
+       alpha prefix; a span with no digit is a word fragment (site 7: the "M" of "MCHC") and is
+       DROPPED so the label survives.
+    R2 under-match completion (STREET_ADDRESS / geo): if an edge falls mid-word (alpha on both
+       sides), extend to the word boundary before surrogation (site 8a: "3214 KETH" ->
+       "3214 KETHLEY"). Fail-safe by construction: extension redacts more, never less.
+    R3 sub-run insurance (identifier families): a span that is a proper sub-run of a longer
+       contiguous digit run (hyphen/slash breaks a run) expands to the full run when the run is
+       <=6 digits, drops above the cap. Composition refinement (proven by the stacked assertion):
+       a ZIP+4 tail (run preceded by \\d{5}-) is DROPPED instead, because expanding surrogates
+       only the +4 as an MRN and strands the 5-digit ZIP prefix that the Branch 5 backstop cannot
+       re-generalize; dropping lets that backstop re-generalize the whole ZIP. A leading sub-run
+       (note-2 "7" of "73084") expands cleanly."""
+    out = []
+    for ent in entities:
+        t, s, e = ent.get("type"), ent.get("start"), ent.get("end")
+        if t not in _REPAIR_ID and t not in _REPAIR_GEO and t not in _REPAIR_SUBRUN:
+            out.append(ent)
+            continue
+        if s is None or e is None:
+            out.append(ent)
+            continue
+        span = text[s:e]
+
+        # R1: over-match split (identifier families). A real identifier of these families always
+        # has a digit run; a span with NO digit is a mis-tagged word ("M" of "MCHC" at site 7,
+        # a procedure name like "ESOPHAGOGASTRODUODENOSCOPY" tagged UNIQUE_ID) -> drop so the word
+        # survives verbatim instead of becoming a fake ID. A digit-bearing span whose edge sits
+        # inside an alpha run (letters continue into a word) retreats past the trailing alpha to
+        # its digit run, preserving a leading alpha prefix.
+        if t in _REPAIR_ID:
+            if not any(c.isdigit() for c in span):
+                print(f"[deid] id-span drop (no digit, not an identifier) {t} {s}:{e} {span!r}")
+                continue
+            if e < len(text) and text[e].isalpha():
+                ne = e
+                while ne > s and text[ne - 1].isalpha():
+                    ne -= 1
+                if ne != e and any(c.isdigit() for c in text[s:ne]):
+                    r = dict(ent); r["end"], r["text"] = ne, text[s:ne]
+                    print(f"[deid] id-span over-match trim {t} {s}:{e}->{s}:{ne} {span!r}->{r['text']!r}")
+                    out.append(r)
+                    continue
+
+        # R2: under-match completion (geo families) -- an edge inside an alpha word.
+        if t in _REPAIR_GEO:
+            ns, nend = s, e
+            if s > 0 and text[s - 1].isalpha() and s < len(text) and text[s].isalpha():
+                while ns > 0 and text[ns - 1].isalpha():
+                    ns -= 1
+            if e < len(text) and text[e].isalpha() and e > s and text[e - 1].isalpha():
+                while nend < len(text) and text[nend].isalpha():
+                    nend += 1
+            if (ns, nend) != (s, e):
+                r = dict(ent); r["start"], r["end"], r["text"] = ns, nend, text[ns:nend]
+                print(f"[deid] geo-span complete {t} {s}:{e}->{ns}:{nend} {span!r}->{r['text']!r}")
+                out.append(r)
+                continue
+
+        # R3: sub-run insurance (identifier/date families) -- proper sub-run of a digit run.
+        if t in _REPAIR_SUBRUN and span.isdigit():
+            a, z = s, e
+            while a > 0 and text[a - 1].isdigit():
+                a -= 1
+            while z < len(text) and text[z].isdigit():
+                z += 1
+            if (a, z) != (s, e):  # the span is a proper sub-run of a longer run
+                if _ZIP4_TAIL_RE.search(text[:a]):
+                    print(f"[deid] sub-run drop (ZIP+4 tail -> Branch 5 backstop) {t} {s}:{e} "
+                          f"run={text[a:z]!r}")
+                    continue
+                if (z - a) <= 6:
+                    r = dict(ent); r["start"], r["end"], r["text"] = a, z, text[a:z]
+                    print(f"[deid] sub-run expand {t} {s}:{e}->{a}:{z} {span!r}->{r['text']!r}")
+                    out.append(r)
+                    continue
+                print(f"[deid] sub-run drop (run {z - a}>6 digits) {t} {s}:{e} run={text[a:z]!r}")
+                continue
+
+        out.append(ent)
+    return out
+
+
 def _build_surrogate_map(subs: list) -> dict:
     """Assemble the original<->surrogate pairs that were ACTUALLY substituted, for
     output-side re-identification. This is additive observation only — it reads values
@@ -879,6 +1136,97 @@ def _build_surrogate_map(subs: list) -> dict:
     return {"version": 1, "pairs": list(pairs.values())}
 
 
+# US state / DC abbreviations. A bare 5-digit ZIP is swept ONLY when one of these appears
+# immediately before it; an unconditioned \d{5} would destroy account numbers, lab accession
+# IDs, and vitals rows. The pilot's real address blocks are all Oklahoma ("SHAWNEE OK 74804"),
+# so OK must stay in the set even though OK/IN/OR double as English words (shapes B/C/D also
+# require a ZIP-shaped token, which bounds that collision).
+_US_STATE_ABBR = (
+    "AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT "
+    "NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC"
+).split()
+_STATE_ALT = "|".join(_US_STATE_ABBR)
+
+# leak shape A: full ZIP+4 surviving verbatim (pilot notes 1/8/12/19: "OK 74804-9638").
+# Left guard forbids a letter/digit/hyphen before (so a run start is clean); right guard
+# forbids a longer digit run. Fires UNCONDITIONALLY: a 5-4 hyphenation is ZIP-distinctive
+# (phones are 3-3-4, SSNs 3-2-4, dates use slashes), so it cannot match those shapes.
+_RE_ZIP4 = re.compile(r"(?<![A-Za-z\d-])\d{5}-\d{4}(?![-\d])")
+
+# leak shape C: truncated/fused ZIP (pilot note 13 / site 8: "74804-96MRN68", or "74804-96"
+# at line end). 5 digits, hyphen, 1-3 digits that do NOT complete a 4-digit +4 (that is shape
+# A). Consumes ZIP material ONLY; any fused surrogate letters ("MRN68") sit OUTSIDE the match
+# and are left for the fusion branches. Composes with Branch 4 (digit-suffix leftward span
+# expansion, not yet cut): whichever runs, the ZIP material dies. Do NOT weaken either pass on
+# the assumption the other will catch it.
+_RE_ZIP_TRUNC = re.compile(r"(?<![A-Za-z\d-])\d{5}-\d{1,3}(?![-\d])")
+
+# leak shape D: prefix-fused ZIP body behind a letter run (pilot note 2: "MRN63084-9167",
+# where the ZIP's LEADING digit was mis-tagged and surrogated to "MRN.."). The ZIP-shaped tail
+# \d{4,5}-\d{4} sits directly after letters; a state/address-supported line gates it (below) so
+# it does not catch letter-prefixed identifiers.
+_RE_ZIP_PREFIX = re.compile(r"(?<=[A-Za-z])\d{4,5}-\d{4}(?![-\d])")
+
+# leak shape B: state-adjacent bare 5-digit ZIP (pilot notes 10/17: "OK 73115"). The state
+# token is the gate; group(1) keeps "STATE ", group(2) is the bare ZIP passed to _generalize_zip.
+# (?![-\d]) forbids a ZIP+4 (shape A) or a longer digit run (a 6+-digit id).
+_RE_STATE_ZIP5 = re.compile(r"(\b(?:" + _STATE_ALT + r")\b\s+)(\d{5})(?![-\d])")
+
+# a line "supports" the letter-adjacent shapes C and D only if it carries a state token
+# (address-shaped); without this gate, \d{5}-\d{1,3} could match numeric ranges elsewhere.
+_RE_STATE_TOKEN = re.compile(r"\b(?:" + _STATE_ALT + r")\b")
+
+
+def _zip_residual_backstop(text: str, deid: "ClinicalDeidentifier", surrogate_map: dict = None) -> str:
+    """Post-substitution TEXT sweep: re-generalize ZIP patterns that survived detection.
+
+    A pilot-measured PHI leak class: undetected or partially-covered ZIPs passed verbatim into
+    de-identified output (9 of 12 input ZIPs leaked full or partial ZIP material; the ZIP+4
+    form went 0 for 7). Mirrors the patient-token backstop above: a text-level re.sub net below
+    the substitution loop. All surrogate policy is delegated to deid._generalize_zip (which
+    expects a BARE ZIP string), so the state prefix is split off here and reattached;
+    _generalize_zip itself is not modified.
+
+    surrogate_map (optional, return_map path only): the already-built re-id map. When present, a
+    ZIP that is ALREADY a recorded POSTCODE surrogate is left untouched, so its map value stays
+    locatable in the output for the CPT grader's re-identification overlay (README: return_map ->
+    "restore the real entities in its output"). Raw undetected input ZIPs are never in the map, so
+    their leak neutralization is never skipped; only the harmless re-generalization of an already
+    clean, already-mapped surrogate is suppressed. None -> no protection, so the non-map call path
+    is unchanged (a bare fake ZIP is still harmlessly re-generalized).
+
+    Idempotence: on already-clean output with no map, the pass is a harmless RE-GENERALIZATION,
+    not a strict no-op. A prior fake ZIP is itself ZIP-shaped and state-adjacent, so it is replaced
+    by another valid fake ZIP of the same format (still de-identified). Never a corruption."""
+    protected = set()
+    if surrogate_map:
+        for p in surrogate_map.get("pairs", []):
+            if p.get("type") == "POSTCODE" and p.get("surrogate"):
+                protected.add(p["surrogate"])
+
+    def gen(zipstr):
+        # Surrogate-map consistency guard: a ZIP that is already a recorded POSTCODE surrogate is
+        # clean and the re-id map points at it; re-generalizing would strand that map value. Skip.
+        # Raw leaked ZIPs are absent from the map, so they are still neutralized below.
+        if zipstr in protected:
+            return zipstr
+        return deid._generalize_zip(zipstr)
+
+    out = []
+    for line in text.split("\n"):
+        # A: full ZIP+4 (unconditional) -- replace the digit run, keep surrounding text.
+        line = _RE_ZIP4.sub(lambda m: gen(m.group(0)), line)
+        # B: state-adjacent bare 5-digit -- keep the "STATE " prefix, re-generalize the ZIP.
+        line = _RE_STATE_ZIP5.sub(lambda m: m.group(1) + gen(m.group(2)), line)
+        if _RE_STATE_TOKEN.search(line):
+            # C: truncated/fused ZIP -- consume ZIP material only, leave fused letters.
+            line = _RE_ZIP_TRUNC.sub(lambda m: gen(m.group(0)), line)
+            # D: prefix-fused ZIP body behind letters -- eat the ZIP tail, leave the letters.
+            line = _RE_ZIP_PREFIX.sub(lambda m: gen(m.group(0)), line)
+        out.append(line)
+    return "\n".join(out)
+
+
 def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict = None,
                     return_map: bool = False):
     """
@@ -902,13 +1250,25 @@ def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict 
     # Pre-process: Merge fragmented DATE entities back together
     # Model sometimes splits "03/15/1965" into "03", "/", "15", etc.
     entities = _merge_adjacent_date_entities(entities, text)
-    
+
+    # DATE span boundary guard: trim a DATE-family span to its maximal date token (header
+    # over-reach like "11/13/2025\nCre") and drop a no-digit DATE span ("Time"/"QDAY") so the
+    # word survives verbatim. After the merge (so it tightens merged spans), before the name/
+    # identifier edge passes.
+    entities = _date_span_boundary(entities, text)
+
     # Pre-process: Combine adjacent FIRST_NAME/LAST_NAME into single NAME entities
     # This ensures "Sarah" + "Johnson" gets same cache key as "Sarah Elizabeth Johnson"
     entities = _combine_adjacent_name_entities(entities, text)
 
     # Split spans that swallowed a sentence boundary ("Lee. Whitehead") and tighten edges
     entities = _split_name_spans(entities, text)
+
+    # Identifier/geo span repair: over-match split (drop the "M" of "MCHC"), under-match
+    # completion (extend "3214 KETH" to "KETHLEY"), sub-run insurance (expand/drop a digit
+    # sub-run; drop a ZIP+4 tail so the Branch 5 backstop owns the ZIP). Before the edge trim
+    # so rule 3's all-digit expansion composes with it as a no-op.
+    entities = _repair_identifier_spans(entities, text)
 
     # Tighten identifier spans (MRN/SSN/account/...) to alphanumeric edges so an NER left/
     # right over-match into an adjacent unit char ("% MRN 12594309") can't fuse the surrogate
@@ -961,9 +1321,25 @@ def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict 
     # by bare digits).
     result = re.sub(r"(\b\d{1,2}/\d{1,2}/\d{4})\d+", r"\1", result)
 
+    # Build the re-id map from the ACTUAL substitutions BEFORE the ZIP backstop (return_map path
+    # only), so the backstop can protect already-recorded POSTCODE surrogates from harmless
+    # re-generalization and keep every map value locatable in the output for the CPT grader's
+    # re-identification overlay (README: return_map). The map reads from _subs, not the text, so
+    # building it here vs at return is value-identical; None on the non-map path leaves that path
+    # unchanged (raw leaked ZIPs, absent from the map, are still neutralized either way).
+    surrogate_map = _build_surrogate_map(_subs) if return_map else None
+
+    # ZIP residual backstop: re-generalize any ZIP pattern that survived detection (undetected
+    # or partially-covered ZIPs leaked verbatim in the pilot). Text-level, below detection; all
+    # surrogate policy stays in _generalize_zip. Sits after the trailing-date sanitizer and
+    # before _clean_dob_lines -- the two are independent (DOB cleanup only rewrites ^DOB: lines
+    # and ZIP surrogates carry no date shape), so this grouping keeps the residual text sweeps
+    # together after substitution.
+    result = _zip_residual_backstop(result, deid, surrogate_map=surrogate_map)
+
     # Post-process DOB line(s) to keep a single clean date
     result = _clean_dob_lines(result)
 
     if return_map:
-        return result, _build_surrogate_map(_subs)
+        return result, surrogate_map
     return result
