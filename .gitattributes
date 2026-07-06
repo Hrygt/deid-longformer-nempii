@@ -1,1 +1,7 @@
+# Line-ending normalization. text=auto lets git detect text vs binary and store LF in the
+# repo; Python and shell are pinned to LF in the working tree too, so a raw file md5 always
+# equals the committed blob md5 and the S3 patchwork payload verification can never diverge
+# on CRLF vs LF (fixes the 2026-07-05 deploy Step-0 HOLD).
+* text=auto
+*.py text eol=lf
 *.sh text eol=lf
