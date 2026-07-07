@@ -228,6 +228,15 @@ class ClinicalDeidentifier:
         # same fake, so "Veronica Brown", "Veronica", and "Brown" stay consistent.
         self._first_tokens = {}
         self._last_tokens = {}
+        # Per-document name-identity sets (fix/surrogate-uniqueness, report
+        # 62ea5da405dc): a fresh surrogate name token must not collide with any
+        # token already ASSIGNED to a different original (_used_name_tokens) nor
+        # with any REAL name token present in the document (_reserved_name_tokens,
+        # populated by reserve_name_tokens() before any draw). Shared across
+        # first/last: the downstream re-id resolver judges uniqueness over the
+        # whole name space, so a first/last cross-collision is just as fatal.
+        self._used_name_tokens = set()
+        self._reserved_name_tokens = set()
 
     def reset_cache(self):
         """Call between documents to reset consistency caches."""
@@ -237,6 +246,8 @@ class ClinicalDeidentifier:
         self._full_name_cache = {}
         self._first_tokens = {}
         self._last_tokens = {}
+        self._used_name_tokens = set()
+        self._reserved_name_tokens = set()
 
     def _get_cached(self, original: str, entity_type: str, generator_fn):
         """Ensure consistent replacement within a document."""
@@ -267,6 +278,43 @@ class ClinicalDeidentifier:
         "phd", "jr", "sr", "ii", "iii", "iv",
     })
 
+    def reserve_name_tokens(self, entities) -> None:
+        """Register every REAL name token in the document BEFORE any surrogate is
+        drawn, so a draw can never equal a real name that only appears later in the
+        note. Call after entity preprocessing, before the replacement loop."""
+        for e in entities or []:
+            if e.get("type") in ("NAME", "FIRST_NAME", "LAST_NAME"):
+                for w in re.findall(r"[a-z]+", (e.get("text") or "").lower()):
+                    if w not in self._NAME_TITLES:
+                        self._reserved_name_tokens.add(w)
+
+    # Draw budget before accepting a non-unique candidate. Faker's en_US name pools
+    # are hundreds of entries, so exhaustion only happens in pathological/stubbed
+    # pools — the bound exists so those cannot loop forever.
+    _MAX_NAME_DRAWS = 24
+
+    def _draw_unique_name(self, generator_fn, original_token: str) -> str:
+        """Draw a surrogate name token that (a) is not the original itself — the real
+        name must never survive de-identification; (b) does not equal ANY real name
+        token in the document; (c) has not already been assigned to a different
+        original. After _MAX_NAME_DRAWS the last candidate is accepted best-effort
+        (a collision then degrades re-id, never scrubbing)."""
+        cand = generator_fn()
+        for _ in range(self._MAX_NAME_DRAWS - 1):
+            cl = cand.lower()
+            if (cl != original_token and cl not in self._reserved_name_tokens
+                    and cl not in self._used_name_tokens):
+                break
+            cand = generator_fn()
+        self._used_name_tokens.add(cand.lower())
+        return cand
+
+    def _register_override_tokens(self, override: str) -> None:
+        """LLM-resolved overrides are deliberate — accepted verbatim, but their tokens
+        join the used-set so later draws cannot collide with them."""
+        for w in re.findall(r"[a-z]+", override.lower()):
+            self._used_name_tokens.add(w)
+
     def _fake_first(self, token: str) -> str:
         # Key by the FIRST real name word so "Michael" and "Michael A" collapse the
         # same; titles are dropped so "Dr Michael" -> "michael".
@@ -276,7 +324,11 @@ class ClinicalDeidentifier:
             return token
         if t not in self._first_tokens:
             ov = getattr(self, "_name_overrides", {}).get("first", {}).get(t)
-            self._first_tokens[t] = ov or self.fake.first_name()
+            if ov:
+                self._register_override_tokens(ov)
+                self._first_tokens[t] = ov
+            else:
+                self._first_tokens[t] = self._draw_unique_name(self.fake.first_name, t)
         return self._first_tokens[t]
 
     def _fake_last(self, token: str) -> str:
@@ -288,7 +340,11 @@ class ClinicalDeidentifier:
             return token
         if t not in self._last_tokens:
             ov = getattr(self, "_name_overrides", {}).get("last", {}).get(t)
-            self._last_tokens[t] = ov or self.fake.last_name()
+            if ov:
+                self._register_override_tokens(ov)
+                self._last_tokens[t] = ov
+            else:
+                self._last_tokens[t] = self._draw_unique_name(self.fake.last_name, t)
         return self._last_tokens[t]
 
     def _fake_name(self, text: str) -> str:
@@ -1274,6 +1330,11 @@ def deidentify_text(text: str, entities: list, seed: int = None, name_map: dict 
     # right over-match into an adjacent unit char ("% MRN 12594309") can't fuse the surrogate
     # into neighboring text. Runs on every path reaching the reverse-slice loop below.
     entities = _trim_identifier_span_edges(entities, text)
+
+    # Register every real name token before ANY surrogate draw, so a surrogate can
+    # never collide with a real name that appears elsewhere in the note — including
+    # one whose entity is processed later. (fix/surrogate-uniqueness)
+    deid.reserve_name_tokens(entities)
 
     # Sort by start position (reverse) for safe replacement
     sorted_entities = sorted(entities, key=lambda x: x["start"], reverse=True)
