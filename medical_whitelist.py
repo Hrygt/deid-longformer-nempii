@@ -398,6 +398,15 @@ MEDICAL_WHITELIST = {
     # -- brand names (the dominant full-word failers) --
     "Ativan", "Versed", "Valium", "Dilaudid", "Sublimaze", "Demerol", "Dolophine", "Luminal",
 
+    # === NAME-FRAGMENT REPAIR WITNESSES (fix/name-span-fragment-repair) ===
+    # The span repair (_repair_name_span_fragments) DROPS a *_NAME fragment whose full
+    # surrounding word is in this whitelist — otherwise it EXPANDS and surrogates the whole
+    # word. This list is therefore LOAD-BEARING for grading fidelity: a fragment-FP on a
+    # non-whitelisted drug over-scrubs it and silently under-credits Risk. Fix any observed
+    # drug loss by ADDING the drug here, never by weakening the repair. Surname-collision
+    # discipline as above (neither is a plausible US surname).
+    "cefepime", "clozapine",
+
     # === CLINICAL STATUS ===
     "Present On",
     "Present Illness",
