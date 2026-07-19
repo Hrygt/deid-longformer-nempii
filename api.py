@@ -410,31 +410,67 @@ def merge_adjacent_entities(entities: list[dict], text: str, max_gap: int = 2) -
     return merged
 
 
-def _drop_name_subword_fragments(text: str, entities: list) -> list:
-    """NER span-sanity guard: drop *_NAME entities that are mid-token sub-fragments of a longer
-    LOWERCASE-continuing word — the NER's subword surrogation false-positive that mangles
-    medication tokens BEFORE the grader sees them (clozapine->'cloz'->raymondozapine,
-    Valium->'Val', methadone->'m'/'meth'). Dropping the fragment lets the drug token survive.
+def _repair_name_span_fragments(text: str, entities: list) -> list:
+    """NER span-sanity REPAIR (supersedes the drop-only _drop_name_subword_fragments guard;
+    grader report 057dab78c412): a *_NAME span with a mid-token boundary on EITHER side —
+    the adjacent character is an ascii letter — is EXPANDED to its full word, so the whole
+    token is surrogated and the re-id map records FULL word -> surrogate (a trailing
+    fragment used to splice the surrogate mid-word: 'alczyk' of 'Kowalczyk' -> 'Kow<surr>').
 
-    CRITERION (length-INDEPENDENT; fragments are 1-4 chars so a length rule misses them): drop
-    iff the character immediately AFTER the span (text[end]) is a LOWERCASE ascii letter — i.e.
-    the span is a prefix cutting into a longer lowercase word. A real name boundary is never
-    that: it is whitespace / punctuation, OR a camelCase UPPERCASE (the run-together
-    'JohnSmith' -> NER spans 'John'(+'S') and 'Smith'(+' ') is PRESERVED — 'S' is uppercase and
-    'Smith' has a right boundary). The left side is deliberately NOT checked: 'Smith' is
-    preceded by the lowercase 'n' of 'John', so a left-side lowercase test would wrongly drop a
-    real name (proven by the B.1 JohnSmith probe). Empirically every observed drug fragment is a
-    prefix continuing lowercase, so the right-continuation test catches them all leak-free.
+    EXCEPT: when the full surrounding word is in MEDICAL_WHITELIST_LOWER the span is
+    DROPPED, preserving the drop-only guard's drug-FP behavior (clozapine/Valium/methadone
+    class; the cefepime 'ce'+'ime' trailing sibling closes here). That whitelist is now
+    LOAD-BEARING for grading fidelity: an over-scrubbed unknown drug silently under-credits
+    Risk (the grader grades the deid text; only the display self-heals via the re-id
+    overlay). Over-scrub of a non-whitelisted word is ACCEPTED on PHI asymmetry — fix any
+    observed drug loss by whitelist ADDITION, never by weakening this repair.
+
+    Two spans expanding to the same word MERGE to one span/one surrogate (types differing ->
+    'NAME'). The run-together 'JohnSmith' therefore becomes ONE whole-token surrogate — the
+    ratified outcome that supersedes the B.1 two-span shape; the zero-leak property holds
+    (see test_name_span_fragment_repair.py).
 
     *_NAME types ONLY — never touches SSN / MRN / DOB / DATE / ADDRESS / etc."""
     NAME_TYPES = ("FIRST_NAME", "LAST_NAME", "NAME")
+
+    def _alpha(c: str) -> bool:
+        return ("a" <= c <= "z") or ("A" <= c <= "Z")
+
     out = []
+    by_span = {}  # final (start, end) -> the emitted NAME entity for that word
     for e in entities:
-        if e.get("type") in NAME_TYPES:
-            en = e.get("end")
-            if en is not None and en < len(text) and ("a" <= text[en] <= "z"):
-                continue  # mid-lowercase-word fragment -> drop (the subword surrogation bug)
-        out.append(e)
+        if e.get("type") not in NAME_TYPES:
+            out.append(e)
+            continue
+        s, en = e.get("start"), e.get("end")
+        if s is None or en is None:
+            out.append(e)
+            continue
+        ns, ne = s, en
+        if (s > 0 and _alpha(text[s - 1])) or (en < len(text) and _alpha(text[en])):
+            while ns > 0 and _alpha(text[ns - 1]):
+                ns -= 1
+            while ne < len(text) and _alpha(text[ne]):
+                ne += 1
+            word = text[ns:ne]
+            if word.lower() in MEDICAL_WHITELIST_LOWER:
+                print(f"[deid] name-fragment drop {e.get('type')} {s}:{en} "
+                      f"{text[s:en]!r} (whitelisted word {word!r})")
+                continue
+            if (ns, ne) != (s, en):
+                print(f"[deid] name-fragment expand {e.get('type')} {s}:{en} "
+                      f"{text[s:en]!r} -> {word!r}")
+        prev = by_span.get((ns, ne))
+        if prev is not None:
+            if prev.get("type") != e.get("type"):
+                prev["type"] = "NAME"
+            print(f"[deid] name-fragment merge {e.get('type')} {s}:{en} "
+                  f"{text[s:en]!r} into {text[ns:ne]!r}")
+            continue
+        ne_ent = dict(e)
+        ne_ent["start"], ne_ent["end"], ne_ent["text"] = ns, ne, text[ns:ne]
+        by_span[(ns, ne)] = ne_ent
+        out.append(ne_ent)
     return out
 
 
@@ -447,7 +483,7 @@ def extract_entities(text: str) -> tuple[list[dict], int]:
 
     if len(chunks) == 1:
         # No chunking needed
-        return _drop_name_subword_fragments(text, extract_entities_single(text)), 1
+        return _repair_name_span_fragments(text, extract_entities_single(text)), 1
 
     # Process each chunk
     all_chunk_entities = []
@@ -462,9 +498,9 @@ def extract_entities(text: str) -> tuple[list[dict], int]:
     for entity in merged_entities:
         entity["text"] = text[entity["start"]:entity["end"]]
 
-    # NER span-sanity guard (subword surrogation FP) — applied to the FINAL spans (offsets
+    # NER span-sanity repair (subword surrogation FP) — applied to the FINAL spans (offsets
     # into the original text), so it is measured by deid_score.py (which calls extract_entities).
-    return _drop_name_subword_fragments(text, merged_entities), len(chunks)
+    return _repair_name_span_fragments(text, merged_entities), len(chunks)
 
 
 def filter_whitelisted_entities(entities: list[dict]) -> list[dict]:
