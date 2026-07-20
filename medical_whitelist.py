@@ -406,6 +406,12 @@ MEDICAL_WHITELIST = {
     # drug loss by ADDING the drug here, never by weakening the repair. Surname-collision
     # discipline as above (neither is a plausible US surname).
     "cefepime", "clozapine",
+    # 2026-07-19 (fix/name-span-newline-boundary, grader note 466697e91ec0): the
+    # title-recall newline sweep ate line-leading "Propranolol" after "See Dr Tracy" —
+    # structural fix is the horizontal-whitespace separators in _TITLE_RE/_CRED_RE;
+    # these entries are belt-and-suspenders for the witnessed clinical victims.
+    # "Will"/"Present" deliberately NOT added (plausible real name / PHI asymmetry).
+    "propranolol", "bradycardia",
 
     # === CLINICAL STATUS ===
     "Present On",

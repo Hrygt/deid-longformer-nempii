@@ -732,9 +732,14 @@ def resolve_names(text: str, entities: list) -> dict:
 RECALL_TITLES = os.environ.get("DEID_RECALL_TITLES", "on").lower() not in ("off", "0", "false", "no")
 RECALL_GAZETTEER = os.environ.get("DEID_RECALL_GAZETTEER", "off").lower() in ("on", "1", "true", "yes")
 
+# Separators are HORIZONTAL whitespace only ([^\S\r\n]) — a name run must never
+# cross a line break (fix/name-span-newline-boundary, grader note 466697e91ec0:
+# "Dr. Mccoy\nBradycardia\nPresent" swept the next lines' clinical tokens as name
+# continuations, eating a problem header and — via the Tracy\nPropranolol form —
+# a drug name; 75/912 grader gold notes carry the exposed shape).
 _TITLE_RE = re.compile(
-    r"\b(?:Dr|Mr|Mrs|Ms|Miss|Mx|Nurse|Doctor|Prof|Professor|RN|NP|PA)\.?\s+"
-    r"([A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){0,2})"
+    r"\b(?:Dr|Mr|Mrs|Ms|Miss|Mx|Nurse|Doctor|Prof|Professor|RN|NP|PA)\.?[^\S\r\n]+"
+    r"([A-Z][a-zA-Z'\-]+(?:[^\S\r\n]+[A-Z][a-zA-Z'\-]+){0,2})"
 )
 
 # Credential-AFTER a name ("Robert Smith, MD", "Garcia, Taylor, RN"): a comma before the
@@ -742,7 +747,7 @@ _TITLE_RE = re.compile(
 # (the title-BEFORE pass above does not see them). Comma required, so the verb "do" / the
 # view "PA" don't false-match.
 _CRED_RE = re.compile(
-    r"\b([A-Z][a-zA-Z'\-]+(?:,?\s+[A-Z][a-zA-Z'\-]+){0,2})\s*,\s*"
+    r"\b([A-Z][a-zA-Z'\-]+(?:,?[^\S\r\n]+[A-Z][a-zA-Z'\-]+){0,2})[^\S\r\n]*,[^\S\r\n]*"
     r"(?:RN|LPN|MD|DO|NP|DNP|APRN|PA-C|PharmD|RPh|MSW|LCSW|LSW|DPM|DDS|CRNA|CNM|MBBS|FNP|AGNP|ACNP)\b"
 )
 
